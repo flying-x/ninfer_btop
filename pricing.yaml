@@ -1,0 +1,28 @@
+# Cloud-API pricing baseline, $ per million tokens.
+# One top-level key per model, each mapping to three rates:
+#   input        = new input tokens
+#   cached_input = cache-hit input (an explicit context-cache hit is billed at
+#                  10% of the standard input price)
+#   output       = output tokens
+# Pick a row with:  --pricing-model <key>   (default: qwen3.8-27b)
+#
+# The keys below are the models the ninfer engine ships (see the ninfer README
+# and model-cards). Rates are the International-scope list prices from Alibaba
+# Cloud Model Studio (Qwen's own API), checked 2026-10-15. Add or edit rows the
+# same way to track other providers or models.
+qwen3.8-27b:
+  input: 0.5
+  cached_input: 0.05
+  output: 3.0
+
+# Qwen3.6-27B (dense; groupwise-int and nvfp4 artifacts)
+qwen3.6-27b:
+  input: 0.6
+  cached_input: 0.06
+  output: 3.6
+
+# Qwen3.6-35B-A3B (MoE, 35B total / 3B active; groupwise-int artifact)
+qwen3.6-35b-a3b:
+  input: 0.375
+  cached_input: 0.0375
+  output: 2.25
