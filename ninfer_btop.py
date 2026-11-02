@@ -5,6 +5,8 @@ Polls the engine's Prometheus metrics endpoint and renders:
   * scrolling bar graph: batch size  (ninfer_requests_running)
   * scrolling bar graph: prefill t/s (rate of ninfer_prefill_tokens_total)
   * scrolling bar graph: decode t/s  (rate of ninfer_generation_tokens_total)
+    (btop's braille glyphs: two samples per character, four vertical
+    levels per text line)
   * totals: input (prompt) / output (generation) tokens
   * Resources and Cache (checkpoint reuse) panels, side by side:
     left = KV pool / state slots / host context gauges; right = "Tok hit"
@@ -584,17 +586,6 @@ class Graph:
     def set_fixed_scale(self, v):
         self.scale = max(v, 1e-9)
 
-    def bar_heights(self, rows):
-        """Return per-column integer bar heights for `rows` tall plot area."""
-        mx = self.max_for_scale()
-        out = []
-        for v in self.hist:
-            if v is None or mx <= 0:
-                out.append(0)
-            else:
-                out.append(int(round(rows * min(1.0, v / mx))))
-        return out
-
 
 # ---------------------------------------------------------------- text mode
 
@@ -782,28 +773,64 @@ def _rate_val(rate):
     return human(rate, "B/s")
 
 
+# Braille glyph table for the bar graphs, taken from btop (aristocratos/btop,
+# Symbols::graph_symbols["braille_up"] in src/btop_draw.cpp) - btop's default
+# graph symbol. Each braille character renders two samples side by side
+# (left dot column = older sample, right dot column = newer one), and each
+# text row packs four dot rows, so a `rows`-row plot resolves 4*rows vertical
+# levels and holds twice as many samples in the same width as the old
+# full/half block columns (which resolved 2*rows levels, one sample each).
+# Index: [older level][newer level], levels 0..4 (0 = empty cell).
+BRAILLE = (
+    (" ", "⢀", "⢠", "⢰", "⢸"),
+    ("⡀", "⣀", "⣠", "⣰", "⣸"),
+    ("⡄", "⣄", "⣤", "⣴", "⣼"),
+    ("⡆", "⣆", "⣦", "⣶", "⣾"),
+    ("⡇", "⣇", "⣧", "⣷", "⣿"),
+)
+
+
+def _braille_level(v, mx, r, rows):
+    """Braille cell level (0..4) a sample reaches in text row r (0 = top) of
+    a `rows`-row plot. Mirrors btop's Graphs::_create: 4 when the sample is
+    at/above the band top of that row, 0 at/below the band bottom, else the
+    4-step fraction of the band with btop's rounding bias (0.1, or 0.3 when
+    the plot is a single row). v is autoscaled against mx."""
+    if v is None or mx <= 0:
+        return 0
+    pct = min(100.0, v / mx * 100.0)
+    high = 100.0 * (rows - r) / rows
+    low = 100.0 * (rows - r - 1) / rows
+    if pct >= high:
+        return 4
+    if pct <= low:
+        return 0
+    mod = 0.3 if rows == 1 else 0.1
+    return max(0, min(4, int(round((pct - low) * 4 / (high - low) + mod))))
+
+
 def draw_bar_graph(scr, y, graph: Graph, rows, width, key, c):
-    heights = graph.bar_heights(rows)
     hist_vals = list(graph.hist)
+    plot_w = min(width - 14, len(hist_vals) // 2)  # two samples per braille char
+    mx = graph.max_for_scale()
     peak_v = max((v for v in hist_vals if v is not None), default=0.0)
-    plot_w = min(width - 14, len(heights))
     base_attr = curses.color_pair(c.get(key, 0))
     # window-max samples are highlighted (bold peak color, or reverse video
     # when the terminal has no colors)
     peak_attr = (curses.color_pair(c["peak"]) | curses.A_BOLD) if "peak" in c else curses.A_REVERSE
     for col in range(plot_w):
-        h = heights[col]
-        attr = peak_attr if (peak_v > 0 and hist_vals[col] == peak_v) else base_attr
+        # leftmost character holds the most recent pair (newest on the left)
+        i = 2 * (plot_w - 1 - col)
+        old_v, new_v = hist_vals[i], hist_vals[i + 1]
+        attr = peak_attr if (peak_v > 0 and (old_v == peak_v or new_v == peak_v)) else base_attr
+        # band r is measured from the top of the plot (btop convention),
+        # so it maps to text row y + r - the bars fill up from the baseline
         for r in range(rows):
-            y_ = y + (rows - 1 - r)
-            if r < h:
-                ch = "█"
-            elif r == h:
-                ch = "▄" if h > 0 else " "
-            else:
+            ch = BRAILLE[_braille_level(old_v, mx, r, rows)][_braille_level(new_v, mx, r, rows)]
+            if ch == " ":
                 continue
             try:
-                scr.addstr(y_, 1 + col, ch, attr)
+                scr.addstr(y + r, 1 + col, ch, attr)
             except curses.error:
                 pass
     # baseline
@@ -1042,7 +1069,8 @@ def main_loop(stdscr, args):
 
     max_y, max_x = stdscr.getmaxyx()
     gwidth = max(20, max_x - 16)
-    graphs = {"batch": Graph(gwidth), "toks": Graph(gwidth), "prefill": Graph(gwidth)}
+    # a braille character holds two samples, so histories are 2x the column count
+    graphs = {"batch": Graph(2 * gwidth), "toks": Graph(2 * gwidth), "prefill": Graph(2 * gwidth)}
     interval = args.interval / 1000.0
     eng = Engine(args.url, interval, args.pricing_rates, label=args.pricing_model)
     paused = False
@@ -1072,8 +1100,8 @@ def main_loop(stdscr, args):
             gwidth = max(20, nx - 16)
             for k in graphs:
                 old = list(graphs[k].hist)
-                graphs[k] = Graph(gwidth)
-                graphs[k].hist.extend(old[-gwidth:])
+                graphs[k] = Graph(2 * gwidth)
+                graphs[k].hist.extend(old[-2 * gwidth:])
 
         frame(stdscr, eng, graphs, paused, c)
 
