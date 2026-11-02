@@ -519,7 +519,7 @@ class TestXferSpillRecall(Base):
         finally:
             nb.time.monotonic = real_mono
 
-    def test_H3_frame_renders_spill_recall_bars(self):
+    def test_H3_frame_renders_spill_recall_sparklines(self):
         nb.curses.color_pair = lambda i: 1 + i
         c = {"ok": 1, "bad": 2, "toks": 3, "dim": 4, "kv": 5, "title": 6,
              "batch": 7, "label": 8, "val": 9, "peak": 10}
@@ -528,27 +528,49 @@ class TestXferSpillRecall(Base):
         eng.m = {"ninfer_engine_ready": 1.0}
         eng.last_frame = s
         eng.start_time = None
+        d2h = nb.Graph(26)
+        for v in [0.0] * 10 + [200.0] * 4 + [0.0] * 12:
+            d2h.add(v)
+        h2d = nb.Graph(26)
+        for v in [0.0] * 24 + [30.0, 30.0]:
+            h2d.add(v)
         graphs = {k: nb.Graph(60) for k in ("batch", "toks", "prefill")}
+        graphs["xfer_d2h"] = d2h
+        graphs["xfer_h2d"] = h2d
         scr = FakeScreen(40, 120)
         nb.frame(scr, eng, graphs, False, c)
         self.assertTrue(rows_with(scr, "Spill"))
         self.assertTrue(rows_with(scr, "Recall"))
         spill = next(t for (_, _, t, _) in scr.writes if "Spill" in t)
         recall = next(t for (_, _, t, _) in scr.writes if "Recall" in t)
-        # spill (200) dominates recall (50) on the shared scale: the spill bar is
-        # full (12/12) and the recall bar is a quarter of it (3/12)
-        self.assertEqual(spill.count("█"), 12)
-        self.assertEqual(recall.count("█"), 3)
-        self.assertGreater(spill.count("█"), recall.count("█"))
+        # each sparkline autoscales to its OWN window peak: a 200 B/s spill
+        # burst and a 30 B/s recall burst both reach the full braille dot,
+        # and the side label is that window peak (the scale of the dots)
+        self.assertIn("⣿", spill)
+        self.assertIn("⣿", recall)
+        self.assertTrue(spill.endswith("200B/s"))
+        self.assertTrue(recall.endswith("30B/s"))
+        # the row must fit the ⅓-width cache column at 120 cols (38 chars)
+        self.assertLessEqual(len(spill), 38)
 
-    def test_H4_xfer_bar_scaling_and_none(self):
-        self.assertEqual(nb._xfer_bar(None, 5), "░" * 12)      # no data
-        self.assertEqual(nb._xfer_bar(5, 0), "░" * 12)          # zero peak
-        self.assertEqual(nb._xfer_bar(5, 5), "█" * 12)          # at peak -> full
-        self.assertEqual(nb._xfer_bar(10, 5), "█" * 12)         # over peak -> clamped
-        self.assertEqual(nb._xfer_bar(2.5, 5), "█" * 6 + "░" * 6)
+    def test_H4_sparkline_autoscale_and_empty(self):
+        # all-zero window: blank sparkline, 0B/s label
+        g = nb.Graph(26)
+        for _ in range(26):
+            g.add(0.0)
+        self.assertEqual(nb._xfer_row("  X  ", g),
+                         "  X  " + " " * 13 + " " + "0B/s")
+        # a burst autoscales against its own window peak, not a shared one
+        g2 = nb.Graph(26)
+        for v in [0.0] * 11 + [5.0] * 4 + [0.0] * 11:
+            g2.add(v)
+        row = nb._xfer_row("  X  ", g2)
+        self.assertIn("⣿", row)            # 5 B/s burst = its own peak
+        self.assertTrue(row.endswith("5B/s"))
+        # no graph yet (first frames): dash placeholder
+        self.assertEqual(nb._xfer_row("  X  ", None), "  X  " + " " * 14 + "—")
+        # rate label formatting is unchanged
         self.assertEqual(nb._rate_val(None), "   —")
-        self.assertEqual(nb._rate_val(200.0), "200B/s")
         self.assertEqual(nb._rate_val(12_400_000.0), "12.40MB/s")
 
 

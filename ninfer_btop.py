@@ -840,16 +840,26 @@ def draw_triple_panel(scr, y, left_title, mid_title, right_title, c, width):
     return y + 1, s1, s2
 
 
-def _xfer_bar(rate, peak, width=12):
-    """Small horizontal bar for a transfer rate, scaled to ``peak`` (both
-    bytes/s). Filled cells over empty cells; all-empty for no data or a zero
-    peak, so the two spill/recall bars share one scale and the longer bar is
-    the dominant direction."""
-    if rate is None or peak <= 0:
-        return "░" * width
-    filled = int(round(width * (rate / peak)))
-    filled = max(0, min(width, filled))
-    return "█" * filled + "░" * (width - filled)
+def _xfer_row(label, graph, width=13):
+    """One cache-panel transfer row: a one-row braille sparkline over the
+    graph's window (the same dots as the main bar graphs, two samples per
+    character), autoscaled to its own window peak, with that peak as the
+    side label for scale. Unlike a one-poll bar, a sub-frame transfer burst
+    (a few-MS recall DMA) stays visible for the whole graph window. The row
+    is label + width + 1 + the peak label, which at 120 cols fits the
+    ⅓-width cache column with the longest label (…MB/s, 10 chars)."""
+    if graph is None:
+        return label + " " * (width + 1) + "—"
+    hist = list(graph.hist)
+    n = min(width, len(hist) // 2)
+    mx = graph.max_for_scale()
+    cells = []
+    for col in range(n):
+        i = 2 * (n - 1 - col)  # leftmost char holds the newest pair
+        cells.append(BRAILLE[_braille_level(hist[i], mx, 0, 1)]
+                     [_braille_level(hist[i + 1], mx, 0, 1)])
+    spark = "".join(cells).ljust(width)
+    return label + spark + " " + _rate_val(mx)
 
 
 def _rate_val(rate):
@@ -1100,8 +1110,6 @@ def frame(scr, eng, graphs, paused, c):
                 in_line = "  Tok hit :   n/a  (no input yet)"
             req_line = (f"  Req hit : {rh * 100:5.1f}%" if rh is not None
                         else "  Req hit :   n/a  (no bindings yet)")
-            sr, rr = s.get("spill_rate"), s.get("recall_rate")
-            peak = max(sr or 0.0, rr or 0.0)   # shared scale: longer bar = dominant
             verdicts = {"ok": ("ok", "ok"),
                         "tight": ("tight — pool near full", "toks"),
                         "small": ("TOO SMALL — grow the pool", "bad"),
@@ -1109,16 +1117,16 @@ def frame(scr, eng, graphs, paused, c):
             vtxt, vkey = verdicts.get(s.get("cache_state", "n/a"),
                                       (s.get("cache_state", ""), "dim"))
             right = [in_line, req_line,
-                     "  Spill  (d2h)  " + _xfer_bar(sr, peak) + "  " + _rate_val(sr),
-                     "  Recall (h2d)  " + _xfer_bar(rr, peak) + "  " + _rate_val(rr),
+                     _xfer_row("  Spill  (d2h)  ", graphs.get("xfer_d2h")),
+                     _xfer_row("  Recall (h2d)  ", graphs.get("xfer_h2d")),
                      f"  Pool    : {vtxt}"]
         else:
             left = ["  Capacity  : —", "  In use    : —", "  Cached    : —",
                     "  Peak      : —", ""]
             mid = ["  Capacity  : —", "  Cached    : —", "  Peak      : —", "", ""]
             right = ["  Tok hit : —", "  Req hit : —",
-                     "  Spill  (d2h)  " + _xfer_bar(None, 0) + "  —",
-                     "  Recall (h2d)  " + _xfer_bar(None, 0) + "  —", ""]
+                     _xfer_row("  Spill  (d2h)  ", graphs.get("xfer_d2h")),
+                     _xfer_row("  Recall (h2d)  ", graphs.get("xfer_h2d")), ""]
         y, s1, s2 = draw_triple_panel(scr, y, "Device KV", "Host KV",
                                       "Cache (checkpoint reuse)", c, width)
         w0 = s1 - 1
@@ -1182,7 +1190,10 @@ def main_loop(stdscr, args):
     max_y, max_x = stdscr.getmaxyx()
     gwidth = max(20, max_x - 16)
     # a braille character holds two samples, so histories are 2x the column count
-    graphs = {"batch": Graph(2 * gwidth), "toks": Graph(2 * gwidth), "prefill": Graph(2 * gwidth)}
+    graphs = {"batch": Graph(2 * gwidth), "toks": Graph(2 * gwidth), "prefill": Graph(2 * gwidth),
+              # transfer sparklines: fixed 13-char width (26 samples ~ 13 s
+              # at the default 500 ms poll), independent of terminal width
+              "xfer_d2h": Graph(26), "xfer_h2d": Graph(26)}
     interval = args.interval / 1000.0
     eng = Engine(args.url, interval, args.pricing_rates, label=args.pricing_model)
     paused = False
@@ -1201,16 +1212,17 @@ def main_loop(stdscr, args):
                 graphs["batch"].add(s["running"])
                 graphs["toks"].add(s["toks_per_s"])
                 graphs["prefill"].add(s["prefill_tps"])
+                graphs["xfer_d2h"].add(s.get("spill_rate"))
+                graphs["xfer_h2d"].add(s.get("recall_rate"))
             else:
-                graphs["batch"].add_blank()
-                graphs["toks"].add_blank()
-                graphs["prefill"].add_blank()
+                for k in graphs:
+                    graphs[k].add_blank()
 
         # resync graph width on terminal resize
         ny, nx = stdscr.getmaxyx()
         if abs(nx - 16 - gwidth) > 2:
             gwidth = max(20, nx - 16)
-            for k in graphs:
+            for k in ("batch", "toks", "prefill"):  # xfer sparklines stay 13 chars
                 old = list(graphs[k].hist)
                 graphs[k] = Graph(2 * gwidth)
                 graphs[k].hist.extend(old[-2 * gwidth:])
