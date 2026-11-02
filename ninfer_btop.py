@@ -147,6 +147,12 @@ def g(m: dict, name: str, default=None):
     v = m.get(name)
     return v if isinstance(v, float) or isinstance(v, int) else default
 
+def _d2h(m: dict) -> float:
+    """Cumulative device->host transfer bytes across all resources."""
+    return sum(v for (kv, v) in (m.get("ninfer_context_transfer_bytes_total__series") or [])
+               if kv.get("direction") == "d2h")
+
+
 def _pool(m: dict, name: str, domain: str, kind=None):
     """Sum a labeled context-pool gauge over all ranks for one domain
     (device|host) and, optionally, one breakdown kind (capacity / in_use /
@@ -306,7 +312,15 @@ def calibrate(url, log=print, burst=8):
 
     # phase A: max prefill t/s — one big uncached prompt, a couple decode steps
     log("  prefill: one large uncached prompt…")
-    pre0 = g(fetch_metrics(url), "ninfer_prefill_tokens_total", 0.0)
+    mA = fetch_metrics(url)
+    pre0 = g(mA, "ninfer_prefill_tokens_total", 0.0)
+    # context bytes per token, measured below from how much storage the new
+    # calibration context consumes (live-pool growth and/or d2h spill).
+    # poll() uses it to attribute cached tokens to the tier they were
+    # served from (tier-split of the "Tok hit" line).
+    live0 = (_pool(mA, "ninfer_context_pool_bytes", "device", "live")
+             + _pool(mA, "ninfer_context_pool_bytes", "host", "live"))
+    d2h0 = _d2h(mA)
     prompt_a = ("[calib %s] %s\nUsing the lines above as a glossary, write a short "
                 "technical note on tree attention for speculative decoding."
                 % (time.time_ns(), _rand_lines(250)))
@@ -314,8 +328,26 @@ def calibrate(url, log=print, burst=8):
     first_at, _ = _chat_first_chunk(api, model, prompt_a, 16)
     if first_at is None:
         raise RuntimeError("engine returned no tokens during the prefill test")
-    pre1 = g(fetch_metrics(url), "ninfer_prefill_tokens_total", 0.0)
+    time.sleep(0.5)  # settle: let any device->host spill of the test context land
+    mB = fetch_metrics(url)
+    pre1 = g(mB, "ninfer_prefill_tokens_total", 0.0)
     prefill_tps = max(1.0, (pre1 - pre0) / (first_at - t_sent))
+    live1 = (_pool(mB, "ninfer_context_pool_bytes", "device", "live")
+             + _pool(mB, "ninfer_context_pool_bytes", "host", "live"))
+    d2h1 = _d2h(mB)
+    bytes_per_tok = None
+    if pre1 > pre0:
+        # two views of the new context's byte size: on a roomy pool it
+        # raises total live bytes; on a pinned pool it evicts old context
+        # (Δlive ≈ 0) and shows up as device->host spill instead. max()
+        # covers both; on a partially pinned pool it takes the larger view.
+        cands = []
+        if live1 > live0:
+            cands.append((live1 - live0) / (pre1 - pre0))
+        if d2h1 > d2h0:
+            cands.append((d2h1 - d2h0) / (pre1 - pre0))
+        if cands:
+            bytes_per_tok = max(cands)
 
     # phase B: max decode t/s + max concurrency — `burst` parallel requests
     log(f"  decode: {burst} parallel requests…")
@@ -372,7 +404,7 @@ def calibrate(url, log=print, burst=8):
 
     return {"ok": True, "model": model, "concurrency": concurrency,
             "prefill_tps": prefill_tps, "decode_tps": decode_tps,
-            "duration": duration}
+            "duration": duration, "bytes_per_tok": bytes_per_tok}
 
 
 def run_calibration(args):
@@ -529,6 +561,18 @@ class Engine:
             tok_hit = (in_cache / in_tot) if in_tot > 0 else None
             tok_miss = (pre / in_tot) if in_tot > 0 else None
             req_hit = (chkp / (chkp + root)) if (chkp + root) > 0 else None
+            # tier split of the token hits: lifetime host->device recall
+            # bytes / calibrated bytes-per-token ~ how many cached tokens
+            # were served from host RAM (clamped to the cached total — it
+            # also absorbs non-hit restores); the remainder was served in
+            # place from VRAM. None until startup calibration yields bpt
+            # (pre-unification builds report no pool to calibrate against).
+            tok_dev = tok_host = None
+            bpt = CALIB.get("bytes_per_tok") if CALIB else None
+            if bpt and in_tot > 0:
+                host_tok = min(in_cache, recall_tot / bpt)
+                tok_host = host_tok / in_tot
+                tok_dev = (in_cache - host_tok) / in_tot
             # unified context pool, per domain (device = KV, host = state),
             # summed across ranks; 0.0 on pre-unification engine builds
             dev_cap = _pool(m, "ninfer_context_pool_bytes", "device", "capacity")
@@ -568,6 +612,8 @@ class Engine:
                 "util": util,
                 "tok_hit": tok_hit,
                 "req_hit": req_hit,
+                "tok_dev": tok_dev,
+                "tok_host": tok_host,
                 "xfer_rate": xfer_rate,
                 "spill_rate": spill_rate,
                 "recall_rate": recall_rate,
@@ -655,7 +701,12 @@ def run_text(url, rates=None, label=None):
     _th, _rh = s.get("tok_hit"), s.get("req_hit")
     _bits = []
     if _th is not None:
-        _bits.append(f"input hit {_th * 100:.1f}%")
+        if s.get("tok_dev") is not None and s.get("tok_host") is not None:
+            _bits.append(f"input hit {_th * 100:.1f}% "
+                         f"({s['tok_dev'] * 100:.1f}% device, "
+                         f"{s['tok_host'] * 100:.1f}% host)")
+        else:
+            _bits.append(f"input hit {_th * 100:.1f}%")
     if _rh is not None:
         _bits.append(f"request hit {_rh * 100:.1f}%")
     _tag = {"ok": "ok", "tight": "TIGHT (pool near full)",
@@ -1036,8 +1087,17 @@ def frame(scr, eng, graphs, paused, c):
                    _kv_row("Peak", s["host_peak"], s["host_cap"]),
                    "", ""]
             th, rh = s.get("tok_hit"), s.get("req_hit")
-            in_line = (f"  Tok hit : {th * 100:5.1f}%" if th is not None
-                       else "  Tok hit :   n/a  (no input yet)")
+            td, ths = s.get("tok_dev"), s.get("tok_host")
+            if td is not None and ths is not None:
+                # tier split (approximate, see poll()); no space between
+                # the groups: at 120 cols this column is 38 chars wide and
+                # the line must fit, 100.0% included
+                in_line = (f"  Tok hit : {td * 100:4.1f}% (device)"
+                           f"{ths * 100:4.1f}% (host)")
+            elif th is not None:
+                in_line = f"  Tok hit : {th * 100:5.1f}%"
+            else:
+                in_line = "  Tok hit :   n/a  (no input yet)"
             req_line = (f"  Req hit : {rh * 100:5.1f}%" if rh is not None
                         else "  Req hit :   n/a  (no bindings yet)")
             sr, rr = s.get("spill_rate"), s.get("recall_rate")

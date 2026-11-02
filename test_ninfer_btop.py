@@ -405,6 +405,73 @@ class TestCacheHealth(Base):
                             for (_, _, t, a) in scr.writes))
 
 
+    def test_G4_poll_splits_token_hits_by_serving_tier(self):
+        # calibrated at 1000 B/tok; 8MB of lifetime h2d recall => 8000 of
+        # the 100000 cached tokens were served from host RAM, 92000 from VRAM
+        nb.CALIB = dict(CALIB_OK, bytes_per_tok=1000.0)
+        body = ("ninfer_engine_ready 1\n"
+                "ninfer_prompt_tokens_total 1000000\n"
+                "ninfer_prompt_tokens_cached_total 100000\n"
+                "ninfer_prefill_tokens_total 900000\n"
+                "ninfer_context_transfer_bytes_total{resource=\"kv\",pool_id=\"0\",direction=\"h2d\"} 8000000\n")
+        nb._fetch = fake_metrics(body)
+        s = nb.Engine("http://x/metrics", 0.5).poll()
+        self.assertAlmostEqual(s["tok_host"], 8000 / 1000000)
+        self.assertAlmostEqual(s["tok_dev"], 92000 / 1000000)
+        self.assertAlmostEqual(s["tok_dev"] + s["tok_host"], s["tok_hit"])
+
+    def test_G5_host_estimate_clamps_to_the_cached_total(self):
+        # 200MB of h2d recall at 1000 B/tok would imply 200000 host-served
+        # tokens, more than the 100000 actually cached -> clamp to the total
+        nb.CALIB = dict(CALIB_OK, bytes_per_tok=1000.0)
+        body = ("ninfer_engine_ready 1\n"
+                "ninfer_prompt_tokens_total 1000000\n"
+                "ninfer_prompt_tokens_cached_total 100000\n"
+                "ninfer_context_transfer_bytes_total{resource=\"kv\",pool_id=\"0\",direction=\"h2d\"} 200000000\n")
+        nb._fetch = fake_metrics(body)
+        s = nb.Engine("http://x/metrics", 0.5).poll()
+        self.assertAlmostEqual(s["tok_host"], s["tok_hit"])
+        self.assertAlmostEqual(s["tok_dev"], 0.0)
+
+    def test_G6_frame_renders_the_tier_split_tok_hit_line(self):
+        nb.curses.color_pair = lambda i: 1 + i
+        c = {"ok": 1, "bad": 2, "toks": 3, "dim": 4, "kv": 5, "title": 6,
+             "batch": 7, "label": 8, "val": 9, "peak": 10}
+        s = self._sample(tok_hit=0.80, tok_dev=0.46, tok_host=0.34,
+                         cache_state="ok")
+        eng = make_engine(True)
+        eng.m = {"ninfer_engine_ready": 1.0}
+        eng.last_frame = s
+        graphs = {k: nb.Graph(60) for k in ("batch", "toks", "prefill")}
+        scr = FakeScreen(40, 120)
+        nb.frame(scr, eng, graphs, False, c)
+        joined = "".join(t for (_, _, t, _) in scr.writes)
+        # the line must fit the 38-char column at 120 cols: no space between
+        # the two groups, both labels fully visible
+        self.assertIn("46.0% (device)34.0% (host)", joined)
+
+    def test_G7_without_calibration_the_plain_tok_hit_line_is_kept(self):
+        # setUp leaves nb.CALIB = None -> no bpt -> no tier split
+        body = ("ninfer_engine_ready 1\n"
+                "ninfer_prompt_tokens_total 1000000\n"
+                "ninfer_prompt_tokens_cached_total 100000\n")
+        nb._fetch = fake_metrics(body)
+        s = nb.Engine("http://x/metrics", 0.5).poll()
+        self.assertIsNone(s["tok_dev"])
+        self.assertIsNone(s["tok_host"])
+        nb.curses.color_pair = lambda i: 1 + i
+        c = {"ok": 1, "bad": 2, "toks": 3, "dim": 4, "kv": 5, "title": 6,
+             "batch": 7, "label": 8, "val": 9, "peak": 10}
+        eng = make_engine(True)
+        eng.m = {"ninfer_engine_ready": 1.0}
+        eng.last_frame = self._sample()
+        graphs = {k: nb.Graph(60) for k in ("batch", "toks", "prefill")}
+        scr = FakeScreen(40, 120)
+        nb.frame(scr, eng, graphs, False, c)
+        self.assertFalse(rows_with(scr, "(device)"))
+        self.assertTrue(rows_with(scr, "Tok hit"))
+
+
 # ----------------------------------- H. spill (d2h) vs recall (h2d) bars
 
 class TestXferSpillRecall(Base):

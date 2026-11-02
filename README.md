@@ -21,7 +21,11 @@ Polls the engine's Prometheus `/metrics` endpoint and renders:
   (`ninfer_context_pool_{bytes,live_bytes,peak_bytes}`, summed over ranks;
   pre-unification engine builds show "n/a" per row). The cache panel shows
   "Tok hit" (token-level input hit: `ninfer_prompt_tokens_cached_total` ÷
-  `ninfer_prompt_tokens_total`) and "Req hit" (request-level hit:
+  `ninfer_prompt_tokens_total`; when startup calibration ran, the figure is
+  split by serving tier — `xx% (device)xx% (host)` — an approximation:
+  lifetime host→device recall bytes ÷ calibrated context bytes-per-token
+  ~ the cached tokens that had to be recalled from host RAM, the remainder
+  was served in place from VRAM) and "Req hit" (request-level hit:
   `ninfer_checkpoint_selections_total` ÷ checkpoint+root selections) ratios,
   a colored pool verdict on the "Pool" row (green "ok" / yellow "tight — pool
   near full" / red "TOO SMALL — grow the pool" / dim "n/a"), and two
