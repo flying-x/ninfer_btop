@@ -127,7 +127,7 @@ Against all of these, the features that are unique to ninfer_btop:
 
 ## Verified against
 
-NInfer upstream `Neroued/ninfer` @ `1882c6ad` (2026-10-29, the post state/KV
+NInfer upstream `Neroued/ninfer` @ `a754fcf3` (2026-11-02, the post state/KV
 unification build; live-verified 2026-11-02): `/metrics` renders
 `published_stats_`, which the engine worker republishes after every decode/prefill step
 (`engine_core.h` → `publish_runtime_stats()`), so the counters are real-time and a
