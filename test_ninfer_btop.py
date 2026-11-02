@@ -471,6 +471,20 @@ class TestCacheHealth(Base):
         self.assertFalse(rows_with(scr, "(device)"))
         self.assertTrue(rows_with(scr, "Tok hit"))
 
+    def test_G8_explicit_bytes_per_tok_works_without_calibration(self):
+        # --bytes-per-tok with --no-calib: CALIB has no "ok" key, the split
+        # still works and utilization stays n/a
+        nb.CALIB = {"bytes_per_tok": 1000.0}
+        body = ("ninfer_engine_ready 1\n"
+                "ninfer_prompt_tokens_total 1000000\n"
+                "ninfer_prompt_tokens_cached_total 100000\n"
+                "ninfer_context_transfer_bytes_total{resource=\"kv\",pool_id=\"0\",direction=\"h2d\"} 30000000\n")
+        nb._fetch = fake_metrics(body)
+        s = nb.Engine("http://x/metrics", 0.5).poll()
+        # 30MB / 1000 B/tok = 30000 host-served tokens
+        self.assertAlmostEqual(s["tok_host"], 30000 / 1000000)
+        self.assertIsNone(s["util"])
+
 
 # ----------------------------------- H. spill (d2h) vs recall (h2d) bars
 

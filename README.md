@@ -20,12 +20,16 @@ Polls the engine's Prometheus `/metrics` endpoint and renders:
   lifetime peak bytes, Host KV = capacity / cached / lifetime peak bytes
   (`ninfer_context_pool_{bytes,live_bytes,peak_bytes}`, summed over ranks;
   pre-unification engine builds show "n/a" per row). The cache panel shows
-  "Tok hit" (token-level input hit: `ninfer_prompt_tokens_cached_total` ÷
-  `ninfer_prompt_tokens_total`; when startup calibration ran, the figure is
-  split by serving tier — `xx% (device)xx% (host)` — an approximation:
-  lifetime host→device recall bytes ÷ calibrated context bytes-per-token
-  ~ the cached tokens that had to be recalled from host RAM, the remainder
-  was served in place from VRAM) and "Req hit" (request-level hit:
+  "Tok hit" (token-level input hit: `ninfer_prompt_tokens_cacwhen bytes-per-token is known (`--bytes-per-tok` or the startup probe), the
+  figure is split by serving tier — `xx% (device)xx% (host)` — an
+  approximation: lifetime host→device recall bytes ÷ bytes-per-token ~ the
+  cached tokens that had to be recalled from host RAM, the remainder was
+  served in place from VRAM. On hybrid models (Qwen3.8-27B: 16 of 64 layers
+  store per-token KV; the GDN layers carry fixed per-request state), only
+  the full-attention layers contribute: `layers_fa x 2 x kv_heads x
+  (head_dim + scale overhead)` — e.g. 16 x 2 x 4 x 264 = 33,792 B/tok for
+  INT8 group-64 KV (fp16 scale per 64-element group), 33,024 for FP8 e4m3
+  group-128) and "Req hit" (request-level hit:
   `ninfer_checkpoint_selections_total` ÷ checkpoint+root selections) ratios,
   a colored pool verdict on the "Pool" row (green "ok" / yellow "tight — pool
   near full" / red "TOO SMALL — grow the pool" / dim "n/a"), and two
@@ -46,13 +50,22 @@ Standard library only (curses + urllib). Nothing to install.
 
 ```
 python3 ninfer_btop.py --url URL [-i INTERVAL_MS] [--text] [--no-calib]
-    [--burst N] [--pricing-model KEY] [--pricing-file PATH]
+    [--burst N] [--bytes-per-tok N] [--pricing-model KEY] [--pricing-file PATH]
 ```
 
 - `--url`   metrics endpoint (required)
 - `-i`      poll interval in ms (default 500)
 - `--text`  one-shot plain-text stats, no TUI
 - `--no-calib`  skip the startup benchmark (utilization shows n/a)
+- `--bytes-per-tok N`  exact context bytes per token for the device/host hit
+  split, computed from the model architecture: full-attention layers x 2
+  (K+V) x kv_heads x (head_dim x dtype_bytes + scale overhead) — INT8
+  group-64 stores 1 B/element plus an fp16 scale per 64-element group
+  (256+8 = 264 B for a 256-dim head), FP8 e4m3 group-128 1 B/element plus a
+  1 B power-of-two scale per 128-element group (256+2 = 258 B) — plus the
+  MTP draft layer if its KV is pooled. Hybrid models count only their
+  full-attention layers. Preferred over the startup probe, which is a noisy
+  best-effort on a busy engine and can make the split saturate (device 0%)
 - `--burst N`   parallel requests for the calibration burst (default 8)
 - `--pricing-model KEY`  cloud-API pricing row to use — a model key from `pricing.yaml` (default `qwen3.8-27b`)
 - `--pricing-file PATH`  use a different pricing YAML file (default: `pricing.yaml` next to the script)

@@ -1252,6 +1252,13 @@ def main():
     ap.add_argument("--text", action="store_true", help="one-shot plain-text stats, no TUI")
     ap.add_argument("--no-calib", action="store_true",
                     help="skip the startup benchmark (utilization shows n/a)")
+    ap.add_argument("--bytes-per-tok", type=float, default=None, metavar="N",
+                    help="context bytes per token for the device/host hit split "
+                         "(exact value from the model architecture: full-attention "
+                         "layers x 2 x kv_heads x (head_dim x dtype_bytes + scale "
+                         "overhead; e.g. INT8 group-64 = 256+8 B per 256-dim head, "
+                         "plus the MTP draft layer if pooled); overrides the value "
+                         "measured by the startup probe")
     ap.add_argument("--burst", type=int, default=8,
                     help="parallel requests for the calibration burst (default 8)")
     ap.add_argument("--pricing-model", default="qwen3.8-27b",
@@ -1271,6 +1278,10 @@ def main():
 
     if not args.no_calib:
         run_calibration(args)
+    if args.bytes_per_tok:
+        global CALIB
+        CALIB = dict(CALIB or {})
+        CALIB["bytes_per_tok"] = args.bytes_per_tok
     if args.text:
         sys.exit(run_text(args.url, args.pricing_rates, args.pricing_model))
     signal.signal(signal.SIGTTOU, signal.SIG_IGN)  # like top: safe even as a background job
