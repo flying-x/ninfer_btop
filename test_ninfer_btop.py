@@ -109,10 +109,11 @@ class Base(unittest.TestCase):
              "toks_per_s": 50.0, "prefill_tps": 100.0,
              "input_total": 1_000_000, "input_cached": 100_000,
              "output_total": 500_000, "prefill": 900_000,
-             "kv_used": 500, "kv_cap": 2000, "slots_used": 3, "slots_cap": 8,
-             "host_used": 1e9, "host_cap": 8e9, "host_peak": 1.5e9,
+             "dev_cap": 8e9, "dev_inuse": 5e9, "dev_cached": 2e9,
+             "dev_peak": 7.5e9,
+             "host_cap": 8e9, "host_cached": 7e9, "host_peak": 7.9e9,
              "util": 0.42, "cloud_cost": 1.955, "max_concurrency": 4,
-             "tok_hit": 0.10, "req_hit": 0.25, "pool_sat": 3 / 8,
+             "tok_hit": 0.10, "req_hit": 0.25,
              "xfer_rate": None, "cache_state": "ok"}
         s.update(over)
         return s
@@ -356,9 +357,9 @@ class TestCacheHealth(Base):
         self.assertEqual(nb.cache_verdict(8, 8, 0.2, 0.9), "small")
 
     def test_G2_poll_populates_cache_fields_and_verdict(self):
-        # 10% of input cached, 90% recomputed -> high miss; pool pinned 8/8
-        # -> pinned + high-miss = two signals -> "small". xfer_rate is None
-        # on the first poll, so it contributes no signal.
+        # 10% of input cached, 90% recomputed -> high miss; host pool pinned
+        # (live == capacity) -> pinned + high-miss = two signals -> "small".
+        # xfer_rate is None on the first poll, so it contributes no signal.
         body = ("ninfer_engine_ready 1\n"
                 "ninfer_max_concurrency 4\n"
                 "ninfer_prompt_tokens_total 1000000\n"
@@ -367,16 +368,17 @@ class TestCacheHealth(Base):
                 "ninfer_generation_tokens_total 500000\n"
                 "ninfer_root_selections_total 3\n"
                 "ninfer_checkpoint_selections_total 1\n"
-                "ninfer_device_state_used_slots 8\n"
-                "ninfer_device_state_capacity_slots 8\n"
+                "ninfer_context_pool_bytes{rank=\"0\",domain=\"host\",kind=\"capacity\"} 8000000000\n"
+                "ninfer_context_pool_live_bytes{rank=\"0\",domain=\"host\",kind=\"in_use\"} 0\n"
+                "ninfer_context_pool_live_bytes{rank=\"0\",domain=\"host\",kind=\"cached\"} 8000000000\n"
+                "ninfer_context_pool_peak_bytes{rank=\"0\",domain=\"host\"} 8000000000\n"
                 "ninfer_context_transfer_seconds_total 0\n")
         nb._fetch = fake_metrics(body)
         s = nb.Engine("http://x/metrics", 0.5).poll()
         self.assertAlmostEqual(s["tok_hit"], 0.10)          # 100000/1000000
         self.assertAlmostEqual(s["req_hit"], 0.25)          # 1/(1+3)
-        self.assertAlmostEqual(s["pool_sat"], 1.0)          # 8/8
-        self.assertEqual(s["slots_used"], 8)
-        self.assertEqual(s["slots_cap"], 8)
+        self.assertEqual(s["host_cached"], 8e9)             # pool pinned: all cached
+        self.assertEqual(s["host_cap"], 8e9)
         self.assertIsNone(s["xfer_rate"])                    # first poll
         self.assertEqual(s["cache_state"], "small")
 
@@ -384,8 +386,8 @@ class TestCacheHealth(Base):
         nb.curses.color_pair = lambda i: 1 + i              # distinct, inspectable pair ids
         c = {"ok": 1, "bad": 2, "toks": 3, "dim": 4, "kv": 5, "title": 6,
              "batch": 7, "label": 8, "val": 9, "peak": 10}
-        s = self._sample(slots_used=8, slots_cap=8, pool_sat=1.0,
-                         tok_hit=0.10, req_hit=0.05, cache_state="small")
+        s = self._sample(host_cached=8e9, tok_hit=0.10, req_hit=0.05,
+                         cache_state="small")
         eng = make_engine(True)
         eng.m = {"ninfer_engine_ready": 1.0}
         eng.last_frame = s
@@ -393,8 +395,9 @@ class TestCacheHealth(Base):
         graphs = {k: nb.Graph(60) for k in ("batch", "toks", "prefill")}
         scr = FakeScreen(40, 120)
         nb.frame(scr, eng, graphs, False, c)
+        self.assertTrue(rows_with(scr, "Device KV"))
+        self.assertTrue(rows_with(scr, "Host KV"))
         self.assertTrue(rows_with(scr, "Cache (checkpoint reuse)"))
-        self.assertTrue(rows_with(scr, "State pool"))
         self.assertTrue(rows_with(scr, "TOO SMALL"))
         # the verdict is painted with the 'bad' color pair (1 + c['bad'] = 3)
         bad_attr = 1 + c["bad"]

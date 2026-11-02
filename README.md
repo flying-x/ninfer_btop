@@ -13,19 +13,22 @@ Polls the engine's Prometheus `/metrics` endpoint and renders:
 - scrolling bar graph: **decode t/s** (inter-poll rate of `ninfer_generation_tokens_total`)
   (The engine publishes stats after every prefill/decode step, so both track live phase.)
 - token totals: input (prompt) / output (generation)
-- Resources ∥ Cache (checkpoint reuse) — two panels side by side: one shared
-  title row ("Resources" left, "Cache (checkpoint reuse)" right) plus 5
-  content rows. Left = KV pool / state slots / host context gauges. Right =
+- Device KV ∥ Host KV ∥ Cache (checkpoint reuse) — three panels side by side
+  on one shared title row plus 5 content rows (btop-style). The two KV
+  columns read the engine's unified context pool per domain (engine ≥
+  2026-10-23 state/KV unification): Device KV = capacity / in use / cached /
+  lifetime peak bytes, Host KV = capacity / cached / lifetime peak bytes
+  (`ninfer_context_pool_{bytes,live_bytes,peak_bytes}`, summed over ranks;
+  pre-unification engine builds show "n/a" per row). The cache panel shows
   "Tok hit" (token-level input hit: `ninfer_prompt_tokens_cached_total` ÷
   `ninfer_prompt_tokens_total`) and "Req hit" (request-level hit:
   `ninfer_checkpoint_selections_total` ÷ checkpoint+root selections) ratios,
-  "State pool" pressure (device state slots used ÷ capacity), a colored pool
-  verdict (green "ok" / yellow "tight" / red "TOO SMALL — raise
-  --device-state-slots" / dim "n/a"), and two context-transfer bars on one
-  shared scale: "Spill (d2h)" (device→host) vs "Recall (h2d)" (host→device),
-  read per-direction from `ninfer_context_transfer_bytes_total`
-  (`direction="d2h"` / `"h2d"`), so host-tier shedding vs re-use is visible
-  at a glance.
+  a colored pool verdict on the "Pool" row (green "ok" / yellow "tight — pool
+  near full" / red "TOO SMALL — grow the pool" / dim "n/a"), and two
+  context-transfer bars on one shared scale: "Spill (d2h)" (device→host) vs
+  "Recall (h2d)" (host→device), read per-direction from
+  `ninfer_context_transfer_bytes_total` (`direction="d2h"` / `"h2d"`), so
+  host-tier shedding vs re-use is visible at a glance.
 - request lanes: running / waiting / prefilling / decode-ready / paused
   (one row under the batch graph)
 
@@ -124,7 +127,8 @@ Against all of these, the features that are unique to ninfer_btop:
 
 ## Verified against
 
-NInfer upstream `Neroued/ninfer` @ `81c8ce0` (2026-10-07): `/metrics` renders
+NInfer upstream `Neroued/ninfer` @ `1882c6ad` (2026-10-29, the post state/KV
+unification build; live-verified 2026-11-02): `/metrics` renders
 `published_stats_`, which the engine worker republishes after every decode/prefill step
 (`engine_core.h` → `publish_runtime_stats()`), so the counters are real-time and a
 between-polls rate is the correct tokens/s signal.

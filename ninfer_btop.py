@@ -8,12 +8,16 @@ Polls the engine's Prometheus metrics endpoint and renders:
     (btop's braille glyphs: two samples per character, four vertical
     levels per text line)
   * totals: input (prompt) / output (generation) tokens
-  * Resources and Cache (checkpoint reuse) panels, side by side:
-    left = KV pool / state slots / host context gauges; right = "Tok hit"
-    (token-level input hit) and "Req hit" (request-level hit) ratios,
-    "State pool" pressure, a colored pool verdict, and two context-transfer
-    bars on a shared scale: "Spill (d2h)" (device→host) vs "Recall (h2d)"
-    (host→device), read per-direction from ninfer_context_transfer_bytes_total
+  * Device KV / Host KV / Cache (checkpoint reuse): three side-by-side
+    panels sharing one title row (btop-style). The KV columns show the
+    engine's unified context pool per domain (engine >= 2026-10-23 state/KV
+    unification) — capacity, in use (device only), cached and lifetime peak
+    bytes, read from ninfer_context_pool_{bytes,live_bytes,peak_bytes}; the
+    cache panel holds "Tok hit" (token-level input hit) and "Req hit"
+    (request-level hit) ratios, a colored pool verdict, and two
+    context-transfer bars on a shared scale: "Spill (d2h)" (device→host) vs
+    "Recall (h2d)" (host→device), read per-direction from
+    ninfer_context_transfer_bytes_total
   * request lanes: running / waiting / prefilling / decode-ready / paused
   * utilization at the bottom: (prefill time + decode time) / uptime,
     estimated from a startup benchmark of the engine
@@ -142,6 +146,17 @@ def fetch_metrics(url: str, timeout: float = 5.0) -> dict:
 def g(m: dict, name: str, default=None):
     v = m.get(name)
     return v if isinstance(v, float) or isinstance(v, int) else default
+
+def _pool(m: dict, name: str, domain: str, kind=None):
+    """Sum a labeled context-pool gauge over all ranks for one domain
+    (device|host) and, optionally, one breakdown kind (capacity / in_use /
+    cached / ...). 0.0 when the engine build does not report the metric
+    (pre-2026-10-23 builds without the unified context pool)."""
+    tot = 0.0
+    for kv, v in m.get(name + "__series") or []:
+        if kv.get("domain") == domain and (kind is None or kv.get("kind") == kind):
+            tot += v
+    return tot
 
 
 def human(n, unit=""):
@@ -379,22 +394,23 @@ def run_calibration(args):
 
 # ---------------------------------------------------------------- state
 
-def cache_verdict(slots_used, slots_cap, xfer_rate, miss_ratio):
-    """Classify on-device state-cache health from /metrics-only signals.
+def cache_verdict(pool_used, pool_cap, xfer_rate, miss_ratio):
+    """Classify context-cache health from /metrics-only signals.
 
     Returns "n/a" (no pool / cache off), "ok", "tight", or "small" (the cache
-    is too small). Three independent signals each add one point; two or more
-    means the device state pool is almost certainly undersized:
+    is too small). The pool is the host domain of the unified context pool
+    (the state pool). Three independent signals each add one point; two or
+    more means the pool is almost certainly undersized:
 
-      - the state pool pinned near capacity (finished-sequence checkpoints
-        are being evicted rather than kept resident)
+      - the pool pinned near capacity (finished-sequence checkpoints are
+        being evicted rather than kept resident)
       - active host<->device state transfer (state constantly shuffled)
       - a high miss ratio (most input recompute instead of cache reuse)
     """
-    if not slots_cap:
+    if not pool_cap:
         return "n/a"
     signals = 0
-    if slots_used / slots_cap >= 0.95:                  # pool pinned -> evictions
+    if pool_used / pool_cap >= 0.95:                    # pool pinned -> evictions
         signals += 1
     if xfer_rate is not None and xfer_rate > 0.05:      # host<->device state churn
         signals += 1
@@ -506,16 +522,25 @@ class Engine:
             cloud_cost = ((in_tot - in_cache) / 1e6 * self.rates["input"]
                           + in_cache / 1e6 * self.rates["cached_input"]
                           + out_tot / 1e6 * self.rates["output"])
-            # cache reuse + is the on-device state cache too small?
+            # cache reuse + is the state pool (host domain of the unified
+            # context pool) too small?
             root = g(m, "ninfer_root_selections_total", 0.0)
             chkp = g(m, "ninfer_checkpoint_selections_total", 0.0)
-            slots_used = g(m, "ninfer_device_state_used_slots", 0.0)
-            slots_cap = g(m, "ninfer_device_state_capacity_slots", 0.0)
             tok_hit = (in_cache / in_tot) if in_tot > 0 else None
             tok_miss = (pre / in_tot) if in_tot > 0 else None
             req_hit = (chkp / (chkp + root)) if (chkp + root) > 0 else None
-            pool_sat = (slots_used / slots_cap) if slots_cap > 0 else None
-            cache_state = cache_verdict(slots_used, slots_cap, xfer_rate, tok_miss)
+            # unified context pool, per domain (device = KV, host = state),
+            # summed across ranks; 0.0 on pre-unification engine builds
+            dev_cap = _pool(m, "ninfer_context_pool_bytes", "device", "capacity")
+            dev_inuse = _pool(m, "ninfer_context_pool_live_bytes", "device", "in_use")
+            dev_cached = _pool(m, "ninfer_context_pool_live_bytes", "device", "cached")
+            dev_peak = _pool(m, "ninfer_context_pool_peak_bytes", "device")
+            host_cap = _pool(m, "ninfer_context_pool_bytes", "host", "capacity")
+            host_inuse = _pool(m, "ninfer_context_pool_live_bytes", "host", "in_use")
+            host_cached = _pool(m, "ninfer_context_pool_live_bytes", "host", "cached")
+            host_peak = _pool(m, "ninfer_context_pool_peak_bytes", "host")
+            cache_state = cache_verdict(host_inuse + host_cached, host_cap,
+                                        xfer_rate, tok_miss)
             self.m = m
             return {
                 "batch": g(m, "ninfer_requests_running", 0.0),
@@ -526,13 +551,13 @@ class Engine:
                 "input_cached": in_cache,
                 "prefill": g(m, "ninfer_prefill_tokens_total", 0.0),
                 "cloud_cost": cloud_cost,
-                "kv_used": g(m, "ninfer_device_kv_used_pages", 0.0),
-                "kv_cap": g(m, "ninfer_device_kv_capacity_pages", 0.0),
-                "slots_used": slots_used,
-                "slots_cap": slots_cap,
-                "host_used": g(m, "ninfer_host_context_used_bytes", 0.0),
-                "host_cap": g(m, "ninfer_host_context_capacity_bytes", 0.0),
-                "host_peak": g(m, "ninfer_host_context_peak_bytes", 0.0),
+                "dev_cap": dev_cap,
+                "dev_inuse": dev_inuse,
+                "dev_cached": dev_cached,
+                "dev_peak": dev_peak,
+                "host_cap": host_cap,
+                "host_cached": host_cached,
+                "host_peak": host_peak,
                 "running": g(m, "ninfer_requests_running", 0.0),
                 "waiting": g(m, "ninfer_requests_waiting", 0.0),
                 "paused": g(m, "ninfer_requests_paused", 0.0),
@@ -543,7 +568,6 @@ class Engine:
                 "util": util,
                 "tok_hit": tok_hit,
                 "req_hit": req_hit,
-                "pool_sat": pool_sat,
                 "xfer_rate": xfer_rate,
                 "spill_rate": spill_rate,
                 "recall_rate": recall_rate,
@@ -589,6 +613,19 @@ class Graph:
 
 # ---------------------------------------------------------------- text mode
 
+def _pool_body(cap, inuse, cached, peak):
+    """One line of context-pool figures for --text output; a note when the
+    engine build does not report the pool at all."""
+    if not cap:
+        return "n/a (pool not reported by this engine build)"
+    body = f"cap {human(cap)}"
+    if inuse is not None:
+        body += f"  in-use {human(inuse)} ({inuse / cap * 100:.1f}%)"
+    body += f"  cached {human(cached)} ({cached / cap * 100:.1f}%)"
+    body += f"  peak {human(peak)}"
+    return body
+
+
 def run_text(url, rates=None, label=None):
     eng = Engine(url, rates=rates, label=label)
     s = eng.poll()
@@ -613,20 +650,16 @@ def run_text(url, rates=None, label=None):
         print(f"saved  : ≈{money(cc)} vs {eng.cloud_label}  "
               f"({eng.rates['input']} $/M in, {eng.rates['cached_input']} $/M cached in, "
               f"{eng.rates['output']} $/M out)")
-    kv = s['kv_used'] / s['kv_cap'] * 100 if s['kv_cap'] else 0
-    print(f"kv     : {s['kv_used']:.0f}/{s['kv_cap']:.0f} pages ({kv:.1f}%)   "
-          f"slots {s['slots_used']:.0f}/{s['slots_cap']:.0f}   "
-          f"host ctx {human(s['host_used'])}/{human(s['host_cap'])}")
-    _th, _rh, _ps = s.get("tok_hit"), s.get("req_hit"), s.get("pool_sat")
+    print(f"kv     : device  {_pool_body(s['dev_cap'], s['dev_inuse'], s['dev_cached'], s['dev_peak'])}")
+    print(f"         host    {_pool_body(s['host_cap'], None, s['host_cached'], s['host_peak'])}")
+    _th, _rh = s.get("tok_hit"), s.get("req_hit")
     _bits = []
     if _th is not None:
         _bits.append(f"input hit {_th * 100:.1f}%")
     if _rh is not None:
         _bits.append(f"request hit {_rh * 100:.1f}%")
-    if _ps is not None:
-        _bits.append(f"state pool {_ps * 100:.0f}%")
     _tag = {"ok": "ok", "tight": "TIGHT (pool near full)",
-            "small": "TOO SMALL (raise --device-state-slots)"}.get(
+            "small": "TOO SMALL (grow the context pool)"}.get(
                 s.get("cache_state", "n/a"), "n/a (no on-device state cache)")
     print(f"cache  : {', '.join(_bits) if _bits else 'n/a'}   [{_tag}]")
     return 0
@@ -732,18 +765,20 @@ def draw_panel(scr, y, title, key, c, width, stats=None):
     return y + 1
 
 
-def draw_split_panel(scr, y, left_title, right_title, c, width):
-    """One title row holding two labeled columns, split near the middle.
+def draw_triple_panel(scr, y, left_title, mid_title, right_title, c, width):
+    """One title row holding three labeled columns, each a third of the width.
 
-    The left column occupies columns [0, split) and the right column
-    [split, width-1). Lets the Resources and Cache panels run side by side in
-    half the vertical space of two stacked panels. Returns (y + 1, split) so
-    callers write their content rows into the two columns one row below the
-    titles.
+    The columns occupy [0, s1), [s1, s2) and [s2, width-1). Lets three
+    panels (Device KV / Host KV / Cache) run side by side in a quarter of
+    the vertical space of three stacked panels. Returns (y + 1, s1, s2) so
+    callers write their content rows into the three columns one row below
+    the titles.
     """
     w = width - 1
-    split = (w + 1) // 2
-    for x0, x1, title in ((0, split, left_title), (split, w, right_title)):
+    s1 = w // 3
+    s2 = w - 1 - w // 3
+    for x0, x1, title in ((0, s1, left_title), (s1, s2, mid_title),
+                          (s2, w, right_title)):
         span = x1 - x0
         body = "─" + title
         txt = (body + "─" * max(0, span - len(body)))[:span]
@@ -751,7 +786,7 @@ def draw_split_panel(scr, y, left_title, right_title, c, width):
             scr.addnstr(y, x0, txt, span)
         except curses.error:
             pass
-    return y + 1, split
+    return y + 1, s1, s2
 
 
 def _xfer_bar(rate, peak, width=12):
@@ -771,6 +806,16 @@ def _rate_val(rate):
     if rate is None:
         return "   —"
     return human(rate, "B/s")
+
+
+def _kv_row(label, val, cap):
+    """Labeled context-pool row for the Device KV / Host KV panels: value plus
+    the share of pool capacity; 'n/a' when the engine build does not report a
+    pool capacity for that domain."""
+    if not cap:
+        return f"  {label:<9} : n/a"
+    pct = f"  ({val / cap * 100:4.1f}%)" if val else ""
+    return f"  {label:<9} : {human(val)}{pct}"
 
 
 # Braille glyph table for the bar graphs, taken from btop (aristocratos/btop,
@@ -916,9 +961,10 @@ def frame(scr, eng, graphs, paused, c):
     g_batch = graphs["batch"]
     g_toks = graphs["toks"]
     # fixed rows: header (2 if calibrated else 1) + 3 titles + 3 baselines
-    # + 1 lane + 1 totals title + 2 totals + 1 shared Resources/Cache
-    # title + 5 shared rows (incl. spill/recall bars) + 1 footer; the
-    # cur/min/max/avg figures sit in the panel titles, plots take the rest
+    # + 1 lane + 1 totals title + 2 totals + 1 shared Device KV/Host KV/Cache
+    # title + 5 shared rows (incl. the spill/recall bars and the pool
+    # verdict) + 1 footer; the cur/min/max/avg figures sit in the panel
+    # titles, plots take the rest
     fixed = 19 if CALIB is not None else 18
     plot_rows = max(1, min(6, (max_y - fixed) // 3))
 
@@ -975,56 +1021,62 @@ def frame(scr, eng, graphs, paused, c):
             pass
         y += 1
 
-    # --- resources + cache, side by side: one shared title row + 5 content
-    #     rows (Resources on the left, Cache on the right incl. the spill/recall
-    #     transfer bars). Halves the vertical space the two panels used to need
-    #     when stacked.
+    # --- device KV + host KV + cache, three side-by-side panels sharing one
+    #     title row (btop-style): a quarter of the space three stacked
+    #     panels would need
     if y + 6 <= max_y - 1:
         if s:
-            kv_pct = f"{s['kv_used'] / s['kv_cap'] * 100:4.1f}%" if s["kv_cap"] else "  n/a"
-            sl_pct = f"{s['slots_used'] / s['slots_cap'] * 100:4.1f}%" if s["slots_cap"] else "  n/a"
-            host_pct = f"{s['host_used'] / s['host_cap'] * 100:4.1f}%" if s["host_cap"] else "  n/a"
+            left = [f"  Capacity  : " + (human(s['dev_cap']) if s['dev_cap'] else "n/a"),
+                    _kv_row("In use", s["dev_inuse"], s["dev_cap"]),
+                    _kv_row("Cached", s["dev_cached"], s["dev_cap"]),
+                    _kv_row("Peak", s["dev_peak"], s["dev_cap"]),
+                    ""]
+            mid = [f"  Capacity  : " + (human(s['host_cap']) if s['host_cap'] else "n/a"),
+                   _kv_row("Cached", s["host_cached"], s["host_cap"]),
+                   _kv_row("Peak", s["host_peak"], s["host_cap"]),
+                   "", ""]
             th, rh = s.get("tok_hit"), s.get("req_hit")
             in_line = (f"  Tok hit : {th * 100:5.1f}%" if th is not None
                        else "  Tok hit :   n/a  (no input yet)")
             req_line = (f"  Req hit : {rh * 100:5.1f}%" if rh is not None
                         else "  Req hit :   n/a  (no bindings yet)")
-            pool = f"  State pool : {s['slots_used']:>4.0f}/{s['slots_cap']:.0f} {sl_pct}"
             sr, rr = s.get("spill_rate"), s.get("recall_rate")
             peak = max(sr or 0.0, rr or 0.0)   # shared scale: longer bar = dominant
-            left = [f"  KV     : {s['kv_used']:>6,.0f}/{s['kv_cap']:,.0f}  {kv_pct}",
-                    f"  Slots  : {s['slots_used']:>4.0f}/{s['slots_cap']:.0f}  {sl_pct}",
-                    f"  Host   : {human(s['host_used'])}/{human(s['host_cap'])}  {host_pct}",
-                    "", ""]
-            right = [in_line, req_line, pool,
+            verdicts = {"ok": ("ok", "ok"),
+                        "tight": ("tight — pool near full", "toks"),
+                        "small": ("TOO SMALL — grow the pool", "bad"),
+                        "n/a": ("n/a (no state cache)", "dim")}
+            vtxt, vkey = verdicts.get(s.get("cache_state", "n/a"),
+                                      (s.get("cache_state", ""), "dim"))
+            right = [in_line, req_line,
                      "  Spill  (d2h)  " + _xfer_bar(sr, peak) + "  " + _rate_val(sr),
-                     "  Recall (h2d)  " + _xfer_bar(rr, peak) + "  " + _rate_val(rr)]
+                     "  Recall (h2d)  " + _xfer_bar(rr, peak) + "  " + _rate_val(rr),
+                     f"  Pool    : {vtxt}"]
         else:
-            left = ["  KV     : —", "  Slots  : —", "  Host   : —", "", ""]
-            right = ["  Tok hit : —", "  Req hit : —", "  State pool : —",
+            left = ["  Capacity  : —", "  In use    : —", "  Cached    : —",
+                    "  Peak      : —", ""]
+            mid = ["  Capacity  : —", "  Cached    : —", "  Peak      : —", "", ""]
+            right = ["  Tok hit : —", "  Req hit : —",
                      "  Spill  (d2h)  " + _xfer_bar(None, 0) + "  —",
-                     "  Recall (h2d)  " + _xfer_bar(None, 0) + "  —"]
-            pool = ""
-        y, split = draw_split_panel(scr, y, "Resources", "Cache (checkpoint reuse)", c, width)
-        leftw = split - 1
-        rightw = width - 1 - split
+                     "  Recall (h2d)  " + _xfer_bar(None, 0) + "  —", ""]
+        y, s1, s2 = draw_triple_panel(scr, y, "Device KV", "Host KV",
+                                      "Cache (checkpoint reuse)", c, width)
+        w0 = s1 - 1
+        w1 = s2 - 1 - s1
+        w2 = width - 1 - s2
         for i in range(5):
             try:
-                scr.addnstr(y + i, 0, left[i][:leftw], leftw)
-                scr.addnstr(y + i, split, right[i][:rightw], rightw)
+                scr.addnstr(y + i, 0, left[i][:w0], w0)
+                scr.addnstr(y + i, s1, mid[i][:w1], w1)
+                scr.addnstr(y + i, s2, right[i][:w2], w2)
             except curses.error:
                 pass
         if s:
-            verdicts = {"ok": ("ok", "ok"),
-                        "tight": ("tight — pool near full", "toks"),
-                        "small": ("TOO SMALL — raise --device-state-slots", "bad"),
-                        "n/a": ("n/a (no on-device state cache)", "dim")}
-            vtxt, vkey = verdicts.get(s.get("cache_state", "n/a"),
-                                      (s.get("cache_state", ""), "dim"))
-            x = split + len(pool) + 1
+            # the pool verdict on the cache column's pool row, colored
+            x = s2 + len("  Pool    : ")
             if x < width - 1:
                 try:
-                    scr.addnstr(y + 2, x, vtxt[:width - 1 - x], width - 1 - x,
+                    scr.addnstr(y + 4, x, vtxt[:width - 1 - x], width - 1 - x,
                                 curses.color_pair(c.get(vkey, 0)))
                 except curses.error:
                     pass
