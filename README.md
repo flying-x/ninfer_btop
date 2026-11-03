@@ -20,7 +20,7 @@ Polls the engine's Prometheus `/metrics` endpoint and renders:
   lifetime peak bytes, Host KV = capacity / cached / lifetime peak bytes
   (`ninfer_context_pool_{bytes,live_bytes,peak_bytes}`, summed over ranks;
   pre-unification engine builds show "n/a" per row). The cache panel shows
-  "Tok hit" (token-level input hit: `ninfer_prompt_tokens_cacwhen bytes-per-token is known (`--bytes-per-tok` or the startup probe), the
+  "Tok hit" (token-level input hit: `ninfer_prompt_tokens_cacwhen bytes-per-token is known via `--bytes-per-tok` (see `bytes_per_token.md`), the
   figure is split by serving tier — `xx% (device)xx% (host)` — an
   approximation: lifetime host→device recall bytes ÷ bytes-per-token ~ the
   cached tokens that had to be recalled from host RAM, the remainder was
@@ -64,8 +64,9 @@ python3 ninfer_btop.py --url URL [-i INTERVAL_MS] [--text] [--no-calib]
   (256+8 = 264 B for a 256-dim head), FP8 e4m3 group-128 1 B/element plus a
   1 B power-of-two scale per 128-element group (256+2 = 258 B) — plus the
   MTP draft layer if its KV is pooled. Hybrid models count only their
-  full-attention layers. Preferred over the startup probe, which is a noisy
-  best-effort on a busy engine and can make the split saturate (device 0%)
+  full-attention layers. Without the flag the tier split is off and the Tok
+  hit line shows the combined figure; the value is exact for the model +
+  KV dtype and never saturates like a measured estimate would
 - `--burst N`   parallel requests for the calibration burst (default 8)
 - `--pricing-model KEY`  cloud-API pricing row to use — a model key from `pricing.yaml` (default `qwen3.8-27b`)
 - `--pricing-file PATH`  use a different pricing YAML file (default: `pricing.yaml` next to the script)

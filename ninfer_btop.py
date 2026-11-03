@@ -24,7 +24,9 @@ Polls the engine's Prometheus metrics endpoint and renders:
 
 On startup the script benchmarks the engine: one large uncached prompt
 (max prefill t/s) and an 8-way parallel burst (max decode t/s and the
-effective max concurrency). Use --no-calib to skip the benchmark.
+effective max concurrency). Use --no-calib to skip the benchmark. The
+device/host tier split of the token hit needs --bytes-per-tok (exact
+context bytes per token, see bytes_per_token.md).
 
 Standard library only (curses + urllib). No packages to install.
 
@@ -35,7 +37,7 @@ row is used instead.
 
 Usage:
   python3 ninfer_btop.py --url URL [-i INTERVAL_MS] [--text] [--no-calib]
-      [--burst N] [--pricing-model KEY] [--pricing-file PATH]
+      [--burst N] [--bytes-per-tok N] [--pricing-model KEY] [--pricing-file PATH]
 
 Keys in TUI mode:
   q / Esc  quit        s  pause/resume polling        r  reset graph auto-scale
@@ -146,12 +148,6 @@ def fetch_metrics(url: str, timeout: float = 5.0) -> dict:
 def g(m: dict, name: str, default=None):
     v = m.get(name)
     return v if isinstance(v, float) or isinstance(v, int) else default
-
-def _d2h(m: dict) -> float:
-    """Cumulative device->host transfer bytes across all resources."""
-    return sum(v for (kv, v) in (m.get("ninfer_context_transfer_bytes_total__series") or [])
-               if kv.get("direction") == "d2h")
-
 
 def _pool(m: dict, name: str, domain: str, kind=None):
     """Sum a labeled context-pool gauge over all ranks for one domain
@@ -314,13 +310,6 @@ def calibrate(url, log=print, burst=8):
     log("  prefill: one large uncached prompt…")
     mA = fetch_metrics(url)
     pre0 = g(mA, "ninfer_prefill_tokens_total", 0.0)
-    # context bytes per token, measured below from how much storage the new
-    # calibration context consumes (live-pool growth and/or d2h spill).
-    # poll() uses it to attribute cached tokens to the tier they were
-    # served from (tier-split of the "Tok hit" line).
-    live0 = (_pool(mA, "ninfer_context_pool_bytes", "device", "live")
-             + _pool(mA, "ninfer_context_pool_bytes", "host", "live"))
-    d2h0 = _d2h(mA)
     prompt_a = ("[calib %s] %s\nUsing the lines above as a glossary, write a short "
                 "technical note on tree attention for speculative decoding."
                 % (time.time_ns(), _rand_lines(250)))
@@ -328,26 +317,9 @@ def calibrate(url, log=print, burst=8):
     first_at, _ = _chat_first_chunk(api, model, prompt_a, 16)
     if first_at is None:
         raise RuntimeError("engine returned no tokens during the prefill test")
-    time.sleep(0.5)  # settle: let any device->host spill of the test context land
     mB = fetch_metrics(url)
     pre1 = g(mB, "ninfer_prefill_tokens_total", 0.0)
     prefill_tps = max(1.0, (pre1 - pre0) / (first_at - t_sent))
-    live1 = (_pool(mB, "ninfer_context_pool_bytes", "device", "live")
-             + _pool(mB, "ninfer_context_pool_bytes", "host", "live"))
-    d2h1 = _d2h(mB)
-    bytes_per_tok = None
-    if pre1 > pre0:
-        # two views of the new context's byte size: on a roomy pool it
-        # raises total live bytes; on a pinned pool it evicts old context
-        # (Δlive ≈ 0) and shows up as device->host spill instead. max()
-        # covers both; on a partially pinned pool it takes the larger view.
-        cands = []
-        if live1 > live0:
-            cands.append((live1 - live0) / (pre1 - pre0))
-        if d2h1 > d2h0:
-            cands.append((d2h1 - d2h0) / (pre1 - pre0))
-        if cands:
-            bytes_per_tok = max(cands)
 
     # phase B: max decode t/s + max concurrency — `burst` parallel requests
     log(f"  decode: {burst} parallel requests…")
@@ -404,7 +376,7 @@ def calibrate(url, log=print, burst=8):
 
     return {"ok": True, "model": model, "concurrency": concurrency,
             "prefill_tps": prefill_tps, "decode_tps": decode_tps,
-            "duration": duration, "bytes_per_tok": bytes_per_tok}
+            "duration": duration}
 
 
 def run_calibration(args):
@@ -562,11 +534,10 @@ class Engine:
             tok_miss = (pre / in_tot) if in_tot > 0 else None
             req_hit = (chkp / (chkp + root)) if (chkp + root) > 0 else None
             # tier split of the token hits: lifetime host->device recall
-            # bytes / calibrated bytes-per-token ~ how many cached tokens
-            # were served from host RAM (clamped to the cached total — it
-            # also absorbs non-hit restores); the remainder was served in
-            # place from VRAM. None until startup calibration yields bpt
-            # (pre-unification builds report no pool to calibrate against).
+            # bytes / bytes-per-token (--bytes-per-tok) ~ how many cached
+            # tokens were served from host RAM (clamped to the cached
+            # total — it also absorbs non-hit restores); the remainder was
+            # served in place from VRAM. None without the flag.
             tok_dev = tok_host = None
             bpt = CALIB.get("bytes_per_tok") if CALIB else None
             if bpt and in_tot > 0:
@@ -1257,8 +1228,9 @@ def main():
                          "(exact value from the model architecture: full-attention "
                          "layers x 2 x kv_heads x (head_dim x dtype_bytes + scale "
                          "overhead; e.g. INT8 group-64 = 256+8 B per 256-dim head, "
-                         "plus the MTP draft layer if pooled); overrides the value "
-                         "measured by the startup probe")
+                         "plus the MTP draft layer if pooled). Required for the "
+                         "device/host tier split; without it the Tok hit line "
+                         "shows the combined figure")
     ap.add_argument("--burst", type=int, default=8,
                     help="parallel requests for the calibration burst (default 8)")
     ap.add_argument("--pricing-model", default="qwen3.8-27b",
