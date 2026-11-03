@@ -8,14 +8,18 @@ see is exactly what the TUI renders.
 
 Expect:
   * every bar fills UP from the baseline (never down from the top)
-  * the staircase ascends left -> right (min on the left, max on the
-    right); the rightmost column holds the window max, so it is painted
-    with the peak highlight
-  * the diagonal shows the braille sub-row resolution: four dot levels
-    per text row, two samples per character (btop-style)
+  * the staircase ascends left -> right (min on the left = newest, max on
+    the right = oldest); the rightmost column holds the window max, so it
+    is painted with the peak highlight
+  * every character is a flat column of dots (one sample per character,
+    both dot columns at the same level): four dot levels per text row
 
 Run:   python3 bar_graph_test.py            (real terminal; any key quits)
        python3 bar_graph_test.py --text     (plain stdout preview, piped)
+
+Note the convention: the graph scrolls left to right - the newest sample
+enters at the left edge. This test renders the full window at once, so the
+staircase runs min (left, newest) -> max (right, oldest).
 """
 import argparse
 import curses
@@ -27,11 +31,12 @@ import ninfer_btop as nb
 
 
 def make_staircase(rows, plot_w):
-    """A graph whose samples descend max -> min; with the graph's
-    newest-sample-on-the-left convention the rendered staircase ascends
-    left -> right from one level above the baseline to full scale."""
+    """A graph whose samples descend max -> min in time order (oldest = max);
+    with the graph's newest-sample-on-the-left convention the rendered
+    staircase ascends left -> right from one level above the baseline to
+    full scale, and the rightmost (oldest) column carries the peak."""
     levels = rows * 4
-    n = max(2, 2 * plot_w)  # two samples per braille character
+    n = max(2, plot_w)  # one sample per braille character
     g = nb.Graph(n)
     for j in range(n):
         g.add(levels - j * (levels - 1) / (n - 1))
@@ -80,10 +85,9 @@ def run_text():
     for r in range(rows):  # r = 0 is the top row, as in draw_bar_graph
         line = []
         for col in range(plot_w):
-            i = 2 * (plot_w - 1 - col)
-            lo = nb._braille_level(vals[i], mx, r, rows)
-            ln = nb._braille_level(vals[i + 1], mx, r, rows)
-            line.append(nb.BRAILLE[lo][ln])
+            i = plot_w - 1 - col  # leftmost character = newest sample
+            l = nb._braille_level(vals[i], mx, r, rows)
+            line.append(nb.BRAILLE[l][l])  # flat top, one sample per character
         out.append("".join(line))
     out.append("─" * plot_w)
     print("\n".join(out))

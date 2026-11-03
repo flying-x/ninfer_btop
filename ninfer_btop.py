@@ -5,8 +5,11 @@ Polls the engine's Prometheus metrics endpoint and renders:
   * scrolling bar graph: batch size  (ninfer_requests_running)
   * scrolling bar graph: prefill t/s (rate of ninfer_prefill_tokens_total)
   * scrolling bar graph: decode t/s  (rate of ninfer_generation_tokens_total)
-    (btop's braille glyphs: two samples per character, four vertical
-    levels per text line)
+    (btop's braille glyphs: one sample per character - a flat column of
+    dots, never a rising/falling glyph - and four vertical levels per text
+    line; the graphs scroll left to right: the newest sample enters at the
+    left edge, and each poll shifts a graph by exactly one character, so
+    the motion can never jump)
   * totals: input (prompt) / output (generation) tokens
   * Device KV / Host KV / Cache (checkpoint reuse): three side-by-side
     panels sharing one title row (btop-style). The KV columns show the
@@ -556,7 +559,10 @@ class Engine:
 
 
 class Graph:
-    """btop-style scrolling bar history. Newest sample on the left."""
+    """Scrolling bar history. The newest sample sits at the left edge: bars
+    enter on the left and scroll out on the right. One sample per drawn
+    character, so a redraw after each poll shifts the graph by exactly one
+    character - it can never jump."""
 
     def __init__(self, width, floor=0.0):
         self.hist = deque(maxlen=width)
@@ -769,23 +775,26 @@ def draw_triple_panel(scr, y, left_title, mid_title, right_title, c, width):
 
 def _xfer_row(label, graph, width=13):
     """One cache-panel transfer row: a one-row braille sparkline over the
-    graph's window (the same dots as the main bar graphs, two samples per
-    character), autoscaled to its own window peak, with that peak as the
-    side label for scale. Unlike a one-poll bar, a sub-frame transfer burst
-    (a few-MS recall DMA) stays visible for the whole graph window. The row
-    is label + width + 1 + the peak label, which at 120 cols fits the
-    ⅓-width cache column with the longest label (…MB/s, 10 chars)."""
+    graph's window (the same dots as the main bar graphs, one sample per
+    character - a flat column of dots, never a rising/falling glyph),
+    autoscaled to its own window peak, with that peak as the side label for
+    scale. Unlike a one-poll bar, a sub-frame transfer burst (a few-MS
+    recall DMA) stays visible for the whole graph window. The row is label
+    + width + 1 + the peak label, which at 120 cols fits the ⅓-width cache
+    column with the longest label (…MB/s, 10 chars). Like the main graphs
+    the newest sample is on the left, and a partial window grows from that
+    edge."""
     if graph is None:
         return label + " " * (width + 1) + "—"
     hist = list(graph.hist)
-    n = min(width, len(hist) // 2)
+    n = min(width, len(hist))
     mx = graph.max_for_scale()
     cells = []
     for col in range(n):
-        i = 2 * (n - 1 - col)  # leftmost char holds the newest pair
-        cells.append(BRAILLE[_braille_level(hist[i], mx, 0, 1)]
-                     [_braille_level(hist[i + 1], mx, 0, 1)])
-    spark = "".join(cells).ljust(width)
+        i = n - 1 - col  # leftmost character = newest sample
+        l = _braille_level(hist[i], mx, 0, 1)
+        cells.append(BRAILLE[l][l])  # flat top: both dot columns at the same level
+    spark = "".join(cells).ljust(width)  # partial window grows from the left edge
     return label + spark + " " + _rate_val(mx)
 
 
@@ -808,12 +817,12 @@ def _kv_row(label, val, cap):
 
 # Braille glyph table for the bar graphs, taken from btop (aristocratos/btop,
 # Symbols::graph_symbols["braille_up"] in src/btop_draw.cpp) - btop's default
-# graph symbol. Each braille character renders two samples side by side
-# (left dot column = older sample, right dot column = newer one), and each
-# text row packs four dot rows, so a `rows`-row plot resolves 4*rows vertical
-# levels and holds twice as many samples in the same width as the old
-# full/half block columns (which resolved 2*rows levels, one sample each).
-# Index: [older level][newer level], levels 0..4 (0 = empty cell).
+# graph symbol. btop packs two samples into one character (older = left dot
+# column, newer = right dot column); we use the table's single-sample
+# diagonal - BRAILLE[level][level] - so each character is a flat column of
+# dots (never a rising/falling glyph) for exactly one sample. Each text row
+# packs four dot rows, so a `rows`-row plot resolves 4*rows vertical levels.
+# Index: [left level][right level], levels 0..4 (0 = empty cell).
 BRAILLE = (
     (" ", "⢀", "⢠", "⢰", "⢸"),
     ("⡀", "⣀", "⣠", "⣰", "⣸"),
@@ -844,22 +853,27 @@ def _braille_level(v, mx, r, rows):
 
 def draw_bar_graph(scr, y, graph: Graph, rows, width, key, c):
     hist_vals = list(graph.hist)
-    plot_w = min(width - 14, len(hist_vals) // 2)  # two samples per braille char
+    plot_w = min(width - 14, len(hist_vals))  # one sample per braille char
     mx = graph.max_for_scale()
     peak_v = max((v for v in hist_vals if v is not None), default=0.0)
     base_attr = curses.color_pair(c.get(key, 0))
     # window-max samples are highlighted (bold peak color, or reverse video
     # when the terminal has no colors)
     peak_attr = (curses.color_pair(c["peak"]) | curses.A_BOLD) if "peak" in c else curses.A_REVERSE
+    # the newest sample is on the left: the leftmost character holds it and
+    # the graph scrolls left to right (bars enter left, exit right); a
+    # partial (not-yet-full) window grows from the left edge
     for col in range(plot_w):
-        # leftmost character holds the most recent pair (newest on the left)
-        i = 2 * (plot_w - 1 - col)
-        old_v, new_v = hist_vals[i], hist_vals[i + 1]
-        attr = peak_attr if (peak_v > 0 and (old_v == peak_v or new_v == peak_v)) else base_attr
+        i = plot_w - 1 - col  # leftmost character = newest sample
+        v = hist_vals[i]
+        attr = peak_attr if (peak_v > 0 and v == peak_v) else base_attr
         # band r is measured from the top of the plot (btop convention),
         # so it maps to text row y + r - the bars fill up from the baseline
         for r in range(rows):
-            ch = BRAILLE[_braille_level(old_v, mx, r, rows)][_braille_level(new_v, mx, r, rows)]
+            # one sample per character: both dot columns at the same level,
+            # a flat top - never a rising/falling glyph
+            l = _braille_level(v, mx, r, rows)
+            ch = BRAILLE[l][l]
             if ch == " ":
                 continue
             try:
@@ -1108,11 +1122,11 @@ def main_loop(stdscr, args):
 
     max_y, max_x = stdscr.getmaxyx()
     gwidth = max(20, max_x - 16)
-    # a braille character holds two samples, so histories are 2x the column count
-    graphs = {"batch": Graph(2 * gwidth), "toks": Graph(2 * gwidth), "prefill": Graph(2 * gwidth),
-              # transfer sparklines: fixed 13-char width (26 samples ~ 13 s
+    # one sample per drawn character: histories are the column count
+    graphs = {"batch": Graph(gwidth), "toks": Graph(gwidth), "prefill": Graph(gwidth),
+              # transfer sparklines: fixed 13-char width (13 samples ~ 6.5 s
               # at the default 500 ms poll), independent of terminal width
-              "xfer_d2h": Graph(26), "xfer_h2d": Graph(26)}
+              "xfer_d2h": Graph(13), "xfer_h2d": Graph(13)}
     interval = args.interval / 1000.0
     eng = Engine(args.url, interval, args.pricing_rates, label=args.pricing_model)
     paused = False
@@ -1121,6 +1135,9 @@ def main_loop(stdscr, args):
 
     while running:
         now = time.time()
+        # one sample per character: each poll appends exactly one character,
+        # so redrawing after every poll shifts the graph by exactly one
+        # character - there is no pair phase to flip, it cannot jump
         if not paused and now - last_poll >= interval:
             last_poll = now
             s = eng.poll()
@@ -1136,6 +1153,7 @@ def main_loop(stdscr, args):
             else:
                 for k in graphs:
                     graphs[k].add_blank()
+            frame(stdscr, eng, graphs, paused, c)
 
         # resync graph width on terminal resize
         ny, nx = stdscr.getmaxyx()
@@ -1143,10 +1161,9 @@ def main_loop(stdscr, args):
             gwidth = max(20, nx - 16)
             for k in ("batch", "toks", "prefill"):  # xfer sparklines stay 13 chars
                 old = list(graphs[k].hist)
-                graphs[k] = Graph(2 * gwidth)
-                graphs[k].hist.extend(old[-2 * gwidth:])
-
-        frame(stdscr, eng, graphs, paused, c)
+                graphs[k] = Graph(gwidth)
+                graphs[k].hist.extend(old[-gwidth:])
+            frame(stdscr, eng, graphs, paused, c)
 
         ch = stdscr.getch()
         if ch == -1:
@@ -1157,9 +1174,11 @@ def main_loop(stdscr, args):
             running = False
         elif ch == ord("s"):
             paused = not paused
+            frame(stdscr, eng, graphs, paused, c)
         elif ch == ord("r"):
             graphs["batch"].set_autoscale()
             graphs["toks"].set_autoscale()
+            frame(stdscr, eng, graphs, paused, c)
 
     return 0
 
@@ -1167,7 +1186,9 @@ def main_loop(stdscr, args):
 def main():
     ap = argparse.ArgumentParser(description="btop-style dashboard for a ninfer engine")
     ap.add_argument("--url", required=True, help="metrics endpoint (required, e.g. http://host:port/metrics)")
-    ap.add_argument("-i", "--interval", type=int, default=500, help="poll interval in ms (default 500)")
+    ap.add_argument("-i", "--interval", type=int, default=500,
+                help="poll interval in ms (default 500); each poll shifts the "
+                     "bar graphs by exactly one character")
     ap.add_argument("--text", action="store_true", help="one-shot plain-text stats, no TUI")
     ap.add_argument("--no-calib", action="store_true",
                     help="skip the startup benchmark (utilization shows n/a)")

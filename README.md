@@ -12,15 +12,21 @@ Polls the engine's Prometheus `/metrics` endpoint and renders:
   graph shows the work; both rates drop to 0 as soon as the engine is idle.
 - scrolling bar graph: **decode t/s** (inter-poll rate of `ninfer_generation_tokens_total`)
   (The engine publishes stats after every prefill/decode step, so both track live phase.)
+  The graphs scroll left to right (the newest sample enters at the left edge and bars
+  exit on the right — deliberately unlike btop). Each braille character holds exactly
+  one sample, drawn as a flat column of dots (never a rising/falling glyph), so each
+  poll shifts a graph by exactly one character — the motion can never jump.
 - token totals: input (prompt) / output (generation)
 - Device KV ∥ Host KV ∥ Cache (checkpoint reuse) — three panels side by side
-  on one shared title row plus 5 content rows (btop-style). The two KV
+  on one shared title row plus 4 content rows (btop-style). The two KV
   columns read the engine's unified context pool per domain (engine ≥
   2026-10-23 state/KV unification): Device KV = capacity / in use / cached /
   lifetime peak bytes, Host KV = capacity / cached / lifetime peak bytes
   (`ninfer_context_pool_{bytes,live_bytes,peak_bytes}`, summed over ranks;
   pre-unification engine builds show "n/a" per row). The cache panel shows
-  "Tok hit" (token-level input hit: `ninfer_prompt_tokens_cacwhen bytes-per-token is known via `--bytes-per-tok` (see `bytes_per_token.md`), the
+  "Tok hit" (token-level input hit: `ninfer_prompt_tokens_cached_total` ÷
+  `ninfer_prompt_tokens_total`); when bytes-per-token is known via `--bytes-per-tok` (see
+  `bytes_per_token.md`), the
   figure is split by serving tier — `xx% (device)xx% (host)` — an
   approximation: lifetime host→device recall bytes ÷ bytes-per-token ~ the
   cached tokens that had to be recalled from host RAM, the remainder was
@@ -34,7 +40,7 @@ Polls the engine's Prometheus `/metrics` endpoint and renders:
   plus two braille sparklines for context transfers: "Spill (d2h)" (device→host) and
   "Recall (h2d)" (host→device), read per-direction from
   `ninfer_context_transfer_bytes_total` (`direction="d2h"` / `"h2d"`). Each
-  sparkline keeps ~13 s of history, autoscales to its own window peak
+  sparkline keeps ~6.5 s of history, autoscales to its own window peak
   (shown as the side label for scale), and uses the same braille dots as the
   main graphs — so a few-millisecond recall burst that a one-poll bar would
   miss stays visible for the whole window, and host-tier shedding vs re-use
@@ -54,7 +60,8 @@ python3 ninfer_btop.py --url URL [-i INTERVAL_MS] [--text] [--no-calib]
 ```
 
 - `--url`   metrics endpoint (required)
-- `-i`      poll interval in ms (default 500)
+- `-i`      poll interval in ms (default 500); each poll shifts the bar graphs by
+  exactly one character
 - `--text`  one-shot plain-text stats, no TUI
 - `--no-calib`  skip the startup benchmark (utilization shows n/a)
 - `--bytes-per-tok N`  exact context bytes per token for the device/host hit
