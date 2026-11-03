@@ -113,8 +113,7 @@ class Base(unittest.TestCase):
              "dev_peak": 7.5e9,
              "host_cap": 8e9, "host_cached": 7e9, "host_peak": 7.9e9,
              "util": 0.42, "cloud_cost": 1.955, "max_concurrency": 4,
-             "tok_hit": 0.10, "req_hit": 0.25,
-             "xfer_rate": None, "cache_state": "ok"}
+             "tok_hit": 0.10, "req_hit": 0.25}
         s.update(over)
         return s
 
@@ -342,24 +341,8 @@ class TestMetricStatBanner(Base):
 class TestCacheHealth(Base):
     """G: cache reuse + on-device state-cache verdict (Cache panel)."""
 
-    def test_G1_cache_verdict_classifies_pool_health(self):
-        # no pool / cache off
-        self.assertEqual(nb.cache_verdict(0, 0, None, None), "n/a")
-        # healthy pool, no churn, low miss
-        self.assertEqual(nb.cache_verdict(1, 8, None, 0.2), "ok")
-        # single signal (pinned pool) -> tight
-        self.assertEqual(nb.cache_verdict(8, 8, None, 0.2), "tight")
-        # single signal (host<->device churn) -> tight
-        self.assertEqual(nb.cache_verdict(1, 8, 0.2, None), "tight")
-        # two signals (pinned + high miss) -> too small
-        self.assertEqual(nb.cache_verdict(8, 8, None, 0.9), "small")
-        # three signals -> too small
-        self.assertEqual(nb.cache_verdict(8, 8, 0.2, 0.9), "small")
-
-    def test_G2_poll_populates_cache_fields_and_verdict(self):
-        # 10% of input cached, 90% recomputed -> high miss; host pool pinned
-        # (live == capacity) -> pinned + high-miss = two signals -> "small".
-        # xfer_rate is None on the first poll, so it contributes no signal.
+    def test_G2_poll_populates_cache_fields(self):
+        # 10% of input cached, 90% recomputed; host pool pinned
         body = ("ninfer_engine_ready 1\n"
                 "ninfer_max_concurrency 4\n"
                 "ninfer_prompt_tokens_total 1000000\n"
@@ -371,23 +354,21 @@ class TestCacheHealth(Base):
                 "ninfer_context_pool_bytes{rank=\"0\",domain=\"host\",kind=\"capacity\"} 8000000000\n"
                 "ninfer_context_pool_live_bytes{rank=\"0\",domain=\"host\",kind=\"in_use\"} 0\n"
                 "ninfer_context_pool_live_bytes{rank=\"0\",domain=\"host\",kind=\"cached\"} 8000000000\n"
-                "ninfer_context_pool_peak_bytes{rank=\"0\",domain=\"host\"} 8000000000\n"
-                "ninfer_context_transfer_seconds_total 0\n")
+                "ninfer_context_pool_peak_bytes{rank=\"0\",domain=\"host\"} 8000000000\n")
         nb._fetch = fake_metrics(body)
         s = nb.Engine("http://x/metrics", 0.5).poll()
         self.assertAlmostEqual(s["tok_hit"], 0.10)          # 100000/1000000
         self.assertAlmostEqual(s["req_hit"], 0.25)          # 1/(1+3)
         self.assertEqual(s["host_cached"], 8e9)             # pool pinned: all cached
         self.assertEqual(s["host_cap"], 8e9)
-        self.assertIsNone(s["xfer_rate"])                    # first poll
-        self.assertEqual(s["cache_state"], "small")
 
-    def test_G3_frame_renders_cache_panel_and_verdict(self):
+    def test_G3_frame_renders_cache_panel_without_a_verdict(self):
+        # the pool verdict row was dropped: a pinned pool is a normal steady
+        # state, not an alarm, so nothing about it may be painted
         nb.curses.color_pair = lambda i: 1 + i              # distinct, inspectable pair ids
         c = {"ok": 1, "bad": 2, "toks": 3, "dim": 4, "kv": 5, "title": 6,
              "batch": 7, "label": 8, "val": 9, "peak": 10}
-        s = self._sample(host_cached=8e9, tok_hit=0.10, req_hit=0.05,
-                         cache_state="small")
+        s = self._sample(host_cached=8e9, tok_hit=0.10, req_hit=0.05)
         eng = make_engine(True)
         eng.m = {"ninfer_engine_ready": 1.0}
         eng.last_frame = s
@@ -398,11 +379,9 @@ class TestCacheHealth(Base):
         self.assertTrue(rows_with(scr, "Device KV"))
         self.assertTrue(rows_with(scr, "Host KV"))
         self.assertTrue(rows_with(scr, "Cache (checkpoint reuse)"))
-        self.assertTrue(rows_with(scr, "TOO SMALL"))
-        # the verdict is painted with the 'bad' color pair (1 + c['bad'] = 3)
-        bad_attr = 1 + c["bad"]
-        self.assertTrue(any(t.startswith("TOO SMALL") and a == bad_attr
-                            for (_, _, t, a) in scr.writes))
+        joined = "".join(t for (_, _, t, _) in scr.writes)
+        for gone in ("Pool    :", "TOO SMALL", "tight", "TIGHT"):
+            self.assertNotIn(gone, joined)
 
 
     def test_G4_poll_splits_token_hits_by_serving_tier(self):
@@ -437,8 +416,7 @@ class TestCacheHealth(Base):
         nb.curses.color_pair = lambda i: 1 + i
         c = {"ok": 1, "bad": 2, "toks": 3, "dim": 4, "kv": 5, "title": 6,
              "batch": 7, "label": 8, "val": 9, "peak": 10}
-        s = self._sample(tok_hit=0.80, tok_dev=0.46, tok_host=0.34,
-                         cache_state="ok")
+        s = self._sample(tok_hit=0.80, tok_dev=0.46, tok_host=0.34)
         eng = make_engine(True)
         eng.m = {"ninfer_engine_ready": 1.0}
         eng.last_frame = s
@@ -470,6 +448,27 @@ class TestCacheHealth(Base):
         nb.frame(scr, eng, graphs, False, c)
         self.assertFalse(rows_with(scr, "(device)"))
         self.assertTrue(rows_with(scr, "Tok hit"))
+
+    def test_G9_lane_paused_figure_is_red_only_when_nonzero(self):
+        nb.curses.color_pair = lambda i: 1 + i              # distinct, inspectable pair ids
+        c = {"ok": 1, "bad": 2, "toks": 3, "dim": 4, "kv": 5, "title": 6,
+             "batch": 7, "label": 8, "val": 9, "peak": 10}
+        eng = make_engine(True)
+        eng.m = {"ninfer_engine_ready": 1.0}
+        graphs = {k: nb.Graph(60) for k in ("batch", "toks", "prefill")}
+        # paused = 2 -> the "paused 2" segment carries the 'bad' (red) pair
+        eng.last_frame = self._sample(paused=2)
+        scr = FakeScreen(40, 120)
+        nb.frame(scr, eng, graphs, False, c)
+        bad_attr = 1 + c["bad"]
+        self.assertTrue(any("paused 2" in t and a == bad_attr
+                            for (_, _, t, a) in scr.writes))
+        # paused = 0 -> the same segment is painted with the default color
+        eng.last_frame = self._sample(paused=0)
+        scr = FakeScreen(40, 120)
+        nb.frame(scr, eng, graphs, False, c)
+        self.assertTrue(any("paused 0" in t and a == 0
+                            for (_, _, t, a) in scr.writes))
 
     def test_G8_explicit_bytes_per_tok_works_without_calibration(self):
         # --bytes-per-tok with --no-calib: CALIB has no "ok" key, the split

@@ -31,9 +31,7 @@ Polls the engine's Prometheus `/metrics` endpoint and renders:
   INT8 group-64 KV (fp16 scale per 64-element group), 33,024 for FP8 e4m3
   group-128) and "Req hit" (request-level hit:
   `ninfer_checkpoint_selections_total` ÷ checkpoint+root selections) ratios,
-  a colored pool verdict on the "Pool" row (green "ok" / yellow "tight — pool
-  near full" / red "TOO SMALL — grow the pool" / dim "n/a"), and two
-  braille sparklines for context transfers: "Spill (d2h)" (device→host) and
+  plus two braille sparklines for context transfers: "Spill (d2h)" (device→host) and
   "Recall (h2d)" (host→device), read per-direction from
   `ninfer_context_transfer_bytes_total` (`direction="d2h"` / `"h2d"`). Each
   sparkline keeps ~13 s of history, autoscales to its own window peak
@@ -42,7 +40,9 @@ Polls the engine's Prometheus `/metrics` endpoint and renders:
   miss stays visible for the whole window, and host-tier shedding vs re-use
   is visible at a glance.
 - request lanes: running / waiting / prefilling / decode-ready / paused
-  (one row under the batch graph)
+  (one row under the batch graph; the paused figure is red whenever
+  non-zero — a paused request is a live request stalled on a capacity
+  event, the one lane number that signals a problem)
 
 Standard library only (curses + urllib). Nothing to install.
 

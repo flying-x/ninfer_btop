@@ -14,11 +14,11 @@ Polls the engine's Prometheus metrics endpoint and renders:
     unification) — capacity, in use (device only), cached and lifetime peak
     bytes, read from ninfer_context_pool_{bytes,live_bytes,peak_bytes}; the
     cache panel holds "Tok hit" (token-level input hit) and "Req hit"
-    (request-level hit) ratios, a colored pool verdict, and two
-    context-transfer bars on a shared scale: "Spill (d2h)" (device→host) vs
-    "Recall (h2d)" (host→device), read per-direction from
+    (request-level hit) ratios and two context-transfer bars: "Spill (d2h)"
+    (device→host) vs "Recall (h2d)" (host→device), read per-direction from
     ninfer_context_transfer_bytes_total
   * request lanes: running / waiting / prefilling / decode-ready / paused
+    (the paused figure is painted red whenever non-zero)
   * utilization at the bottom: (prefill time + decode time) / uptime,
     estimated from a startup benchmark of the engine
 
@@ -398,35 +398,6 @@ def run_calibration(args):
 
 # ---------------------------------------------------------------- state
 
-def cache_verdict(pool_used, pool_cap, xfer_rate, miss_ratio):
-    """Classify context-cache health from /metrics-only signals.
-
-    Returns "n/a" (no pool / cache off), "ok", "tight", or "small" (the cache
-    is too small). The pool is the host domain of the unified context pool
-    (the state pool). Three independent signals each add one point; two or
-    more means the pool is almost certainly undersized:
-
-      - the pool pinned near capacity (finished-sequence checkpoints are
-        being evicted rather than kept resident)
-      - active host<->device state transfer (state constantly shuffled)
-      - a high miss ratio (most input recompute instead of cache reuse)
-    """
-    if not pool_cap:
-        return "n/a"
-    signals = 0
-    if pool_used / pool_cap >= 0.95:                    # pool pinned -> evictions
-        signals += 1
-    if xfer_rate is not None and xfer_rate > 0.05:      # host<->device state churn
-        signals += 1
-    if miss_ratio is not None and miss_ratio >= 0.6:    # most input recomputed
-        signals += 1
-    if signals >= 2:
-        return "small"
-    if signals == 1:
-        return "tight"
-    return "ok"
-
-
 class Engine:
     def __init__(self, url, interval=0.5, rates=None, label=None):
         self.url = url
@@ -458,7 +429,6 @@ class Engine:
         self._last_t = None
         self._last_gen = None
         self._last_prefill = None
-        self._last_xfer = None
         self._last_spill = None
         self._last_recall = None
 
@@ -483,10 +453,8 @@ class Engine:
             # of each request (decode t/s stays 0 during the prefill phase)
             toks = None
             ptok = None
-            xfer_rate = None
             spill_rate = None
             recall_rate = None
-            xfer = g(m, "ninfer_context_transfer_seconds_total", 0.0)
             # per-direction context-transfer bytes: d2h = device->host spill,
             # h2d = host->device recall (summed across state / main_kv /
             # backend_kv resources)
@@ -500,14 +468,11 @@ class Engine:
                         toks = (gen - self._last_gen) / dt
                     if pre >= self._last_prefill:
                         ptok = (pre - self._last_prefill) / dt
-                    if self._last_xfer is not None and xfer >= self._last_xfer:
-                        xfer_rate = (xfer - self._last_xfer) / dt
                     if self._last_spill is not None and spill_tot >= self._last_spill:
                         spill_rate = (spill_tot - self._last_spill) / dt
                     if self._last_recall is not None and recall_tot >= self._last_recall:
                         recall_rate = (recall_tot - self._last_recall) / dt
             self._last_t, self._last_gen, self._last_prefill = now, gen, pre
-            self._last_xfer = xfer
             self._last_spill, self._last_recall = spill_tot, recall_tot
             # lifetime utilization: estimated busy time (tokens / calibrated
             # max rates) over engine uptime. An underestimate by design:
@@ -526,12 +491,10 @@ class Engine:
             cloud_cost = ((in_tot - in_cache) / 1e6 * self.rates["input"]
                           + in_cache / 1e6 * self.rates["cached_input"]
                           + out_tot / 1e6 * self.rates["output"])
-            # cache reuse + is the state pool (host domain of the unified
-            # context pool) too small?
+            # cache reuse
             root = g(m, "ninfer_root_selections_total", 0.0)
             chkp = g(m, "ninfer_checkpoint_selections_total", 0.0)
             tok_hit = (in_cache / in_tot) if in_tot > 0 else None
-            tok_miss = (pre / in_tot) if in_tot > 0 else None
             req_hit = (chkp / (chkp + root)) if (chkp + root) > 0 else None
             # tier split of the token hits: lifetime host->device recall
             # bytes / bytes-per-token (--bytes-per-tok) ~ how many cached
@@ -554,8 +517,6 @@ class Engine:
             host_inuse = _pool(m, "ninfer_context_pool_live_bytes", "host", "in_use")
             host_cached = _pool(m, "ninfer_context_pool_live_bytes", "host", "cached")
             host_peak = _pool(m, "ninfer_context_pool_peak_bytes", "host")
-            cache_state = cache_verdict(host_inuse + host_cached, host_cap,
-                                        xfer_rate, tok_miss)
             self.m = m
             return {
                 "batch": g(m, "ninfer_requests_running", 0.0),
@@ -585,10 +546,8 @@ class Engine:
                 "req_hit": req_hit,
                 "tok_dev": tok_dev,
                 "tok_host": tok_host,
-                "xfer_rate": xfer_rate,
                 "spill_rate": spill_rate,
                 "recall_rate": recall_rate,
-                "cache_state": cache_state,
             }
         except Exception as e:
             self.ok = False
@@ -680,10 +639,7 @@ def run_text(url, rates=None, label=None):
             _bits.append(f"input hit {_th * 100:.1f}%")
     if _rh is not None:
         _bits.append(f"request hit {_rh * 100:.1f}%")
-    _tag = {"ok": "ok", "tight": "TIGHT (pool near full)",
-            "small": "TOO SMALL (grow the context pool)"}.get(
-                s.get("cache_state", "n/a"), "n/a (no on-device state cache)")
-    print(f"cache  : {', '.join(_bits) if _bits else 'n/a'}   [{_tag}]")
+    print(f"cache  : {', '.join(_bits) if _bits else 'n/a'}")
     return 0
 
 
@@ -994,10 +950,9 @@ def frame(scr, eng, graphs, paused, c):
     g_toks = graphs["toks"]
     # fixed rows: header (2 if calibrated else 1) + 3 titles + 3 baselines
     # + 1 lane + 1 totals title + 2 totals + 1 shared Device KV/Host KV/Cache
-    # title + 5 shared rows (incl. the spill/recall bars and the pool
-    # verdict) + 1 footer; the cur/min/max/avg figures sit in the panel
-    # titles, plots take the rest
-    fixed = 19 if CALIB is not None else 18
+    # title + 4 shared rows (incl. the spill/recall bars) + 1 footer; the
+    # cur/min/max/avg figures sit in the panel titles, plots take the rest
+    fixed = 18 if CALIB is not None else 17
     plot_rows = max(1, min(6, (max_y - fixed) // 3))
 
     # --- batch panel
@@ -1007,13 +962,23 @@ def frame(scr, eng, graphs, paused, c):
                    metric_stat_segments(g_batch, cur_b))
     y = draw_bar_graph(scr, y, g_batch, plot_rows, width, "batch", c)
     if s:
-        lane = (f"running {s['running']:.0f}  ·  waiting {s['waiting']:.0f}  ·  "
-                f"prefilling {s['prefilling']:.0f}  ·  decode-ready {s['decode_ready']:.0f}  ·  "
-                f"paused {s['paused']:.0f}")
-        try:
-            scr.addnstr(y, 1, lane[: width - 2], width - 2)
-        except curses.error:
-            pass
+        # paused is the one lane number that signals a problem: a live
+        # request stalled on a capacity event, so paint it red when non-zero
+        lane_base = (f"running {s['running']:.0f}  ·  waiting {s['waiting']:.0f}  ·  "
+                     f"prefilling {s['prefilling']:.0f}  ·  "
+                     f"decode-ready {s['decode_ready']:.0f}  ·  ")
+        lane_end = f"paused {s['paused']:.0f}"
+        end_attr = curses.color_pair(c.get("bad", 0)) if s["paused"] else 0
+        x = 1
+        for txt, attr in ((lane_base, 0), (lane_end, end_attr)):
+            n = min(len(txt), width - 1 - x)
+            if n <= 0:
+                break
+            try:
+                scr.addnstr(y, x, txt[:n], n, attr)
+            except curses.error:
+                break
+            x += n
         y += 1
 
     # --- prefill tokens/s panel (prompt processing; decode t/s is flat
@@ -1056,17 +1021,16 @@ def frame(scr, eng, graphs, paused, c):
     # --- device KV + host KV + cache, three side-by-side panels sharing one
     #     title row (btop-style): a quarter of the space three stacked
     #     panels would need
-    if y + 6 <= max_y - 1:
+    if y + 5 <= max_y - 1:
         if s:
             left = [f"  Capacity  : " + (human(s['dev_cap']) if s['dev_cap'] else "n/a"),
                     _kv_row("In use", s["dev_inuse"], s["dev_cap"]),
                     _kv_row("Cached", s["dev_cached"], s["dev_cap"]),
-                    _kv_row("Peak", s["dev_peak"], s["dev_cap"]),
-                    ""]
+                    _kv_row("Peak", s["dev_peak"], s["dev_cap"])]
             mid = [f"  Capacity  : " + (human(s['host_cap']) if s['host_cap'] else "n/a"),
                    _kv_row("Cached", s["host_cached"], s["host_cap"]),
                    _kv_row("Peak", s["host_peak"], s["host_cap"]),
-                   "", ""]
+                   ""]
             th, rh = s.get("tok_hit"), s.get("req_hit")
             td, ths = s.get("tok_dev"), s.get("tok_host")
             if td is not None and ths is not None:
@@ -1081,45 +1045,29 @@ def frame(scr, eng, graphs, paused, c):
                 in_line = "  Tok hit :   n/a  (no input yet)"
             req_line = (f"  Req hit : {rh * 100:5.1f}%" if rh is not None
                         else "  Req hit :   n/a  (no bindings yet)")
-            verdicts = {"ok": ("ok", "ok"),
-                        "tight": ("tight — pool near full", "toks"),
-                        "small": ("TOO SMALL — grow the pool", "bad"),
-                        "n/a": ("n/a (no state cache)", "dim")}
-            vtxt, vkey = verdicts.get(s.get("cache_state", "n/a"),
-                                      (s.get("cache_state", ""), "dim"))
             right = [in_line, req_line,
                      _xfer_row("  Spill  (d2h)  ", graphs.get("xfer_d2h")),
-                     _xfer_row("  Recall (h2d)  ", graphs.get("xfer_h2d")),
-                     f"  Pool    : {vtxt}"]
+                     _xfer_row("  Recall (h2d)  ", graphs.get("xfer_h2d"))]
         else:
             left = ["  Capacity  : —", "  In use    : —", "  Cached    : —",
-                    "  Peak      : —", ""]
-            mid = ["  Capacity  : —", "  Cached    : —", "  Peak      : —", "", ""]
+                    "  Peak      : —"]
+            mid = ["  Capacity  : —", "  Cached    : —", "  Peak      : —", ""]
             right = ["  Tok hit : —", "  Req hit : —",
                      _xfer_row("  Spill  (d2h)  ", graphs.get("xfer_d2h")),
-                     _xfer_row("  Recall (h2d)  ", graphs.get("xfer_h2d")), ""]
+                     _xfer_row("  Recall (h2d)  ", graphs.get("xfer_h2d"))]
         y, s1, s2 = draw_triple_panel(scr, y, "Device KV", "Host KV",
                                       "Cache (checkpoint reuse)", c, width)
         w0 = s1 - 1
         w1 = s2 - 1 - s1
         w2 = width - 1 - s2
-        for i in range(5):
+        for i in range(4):
             try:
                 scr.addnstr(y + i, 0, left[i][:w0], w0)
                 scr.addnstr(y + i, s1, mid[i][:w1], w1)
                 scr.addnstr(y + i, s2, right[i][:w2], w2)
             except curses.error:
                 pass
-        if s:
-            # the pool verdict on the cache column's pool row, colored
-            x = s2 + len("  Pool    : ")
-            if x < width - 1:
-                try:
-                    scr.addnstr(y + 4, x, vtxt[:width - 1 - x], width - 1 - x,
-                                curses.color_pair(c.get(vkey, 0)))
-                except curses.error:
-                    pass
-        y += 5
+        y += 4
 
     # --- footer (live utilization at the bottom)
     y = max_y - 1
