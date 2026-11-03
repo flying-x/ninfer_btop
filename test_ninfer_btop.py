@@ -233,7 +233,7 @@ class TestFrameDownState(Base):
         nb.CALIB = calib
         scr = FakeScreen(40, 120)
         graphs = {k: nb.Graph(60) for k in ("batch", "toks", "prefill")}
-        nb.frame(scr, make_engine(ok), graphs, False, {})
+        nb.frame(scr, make_engine(ok), graphs, {})
         return scr
 
     def test_D1_down_calibrated_banner_and_panels_disjoint(self):
@@ -342,7 +342,7 @@ class TestMetricStatBanner(Base):
 
 
 class TestCacheHealth(Base):
-    """G: cache reuse + on-device state-cache verdict (Cache panel)."""
+    """G: cache reuse + device/host tier split (Cache panel) + status line."""
 
     def test_G2_poll_populates_cache_fields(self):
         # 10% of input cached, 90% recomputed; host pool pinned
@@ -357,13 +357,15 @@ class TestCacheHealth(Base):
                 "ninfer_context_pool_bytes{rank=\"0\",domain=\"host\",kind=\"capacity\"} 8000000000\n"
                 "ninfer_context_pool_live_bytes{rank=\"0\",domain=\"host\",kind=\"in_use\"} 0\n"
                 "ninfer_context_pool_live_bytes{rank=\"0\",domain=\"host\",kind=\"cached\"} 8000000000\n"
-                "ninfer_context_pool_peak_bytes{rank=\"0\",domain=\"host\"} 8000000000\n")
+                "ninfer_context_pool_peak_bytes{rank=\"0\",domain=\"host\"} 8000000000\n"
+                "ninfer_max_context_tokens 131072\n")
         nb._fetch = fake_metrics(body)
         s = nb.Engine("http://x/metrics", 0.5).poll()
         self.assertAlmostEqual(s["tok_hit"], 0.10)          # 100000/1000000
         self.assertAlmostEqual(s["req_hit"], 0.25)          # 1/(1+3)
         self.assertEqual(s["host_cached"], 8e9)             # pool pinned: all cached
         self.assertEqual(s["host_cap"], 8e9)
+        self.assertEqual(s["ctx_window"], 131072)           # engine context window
 
     def test_G3_frame_renders_cache_panel_without_a_verdict(self):
         # the pool verdict row was dropped: a pinned pool is a normal steady
@@ -378,7 +380,7 @@ class TestCacheHealth(Base):
         eng.start_time = None
         graphs = {k: nb.Graph(60) for k in ("batch", "toks", "prefill")}
         scr = FakeScreen(40, 120)
-        nb.frame(scr, eng, graphs, False, c)
+        nb.frame(scr, eng, graphs, c)
         self.assertTrue(rows_with(scr, "Device KV"))
         self.assertTrue(rows_with(scr, "Host KV"))
         self.assertTrue(rows_with(scr, "Cache (checkpoint reuse)"))
@@ -425,7 +427,7 @@ class TestCacheHealth(Base):
         eng.last_frame = s
         graphs = {k: nb.Graph(60) for k in ("batch", "toks", "prefill")}
         scr = FakeScreen(40, 120)
-        nb.frame(scr, eng, graphs, False, c)
+        nb.frame(scr, eng, graphs, c)
         joined = "".join(t for (_, _, t, _) in scr.writes)
         # the line must fit the 38-char column at 120 cols: no space between
         # the two groups, both labels fully visible
@@ -448,7 +450,7 @@ class TestCacheHealth(Base):
         eng.last_frame = self._sample()
         graphs = {k: nb.Graph(60) for k in ("batch", "toks", "prefill")}
         scr = FakeScreen(40, 120)
-        nb.frame(scr, eng, graphs, False, c)
+        nb.frame(scr, eng, graphs, c)
         self.assertFalse(rows_with(scr, "(device)"))
         self.assertTrue(rows_with(scr, "Tok hit"))
 
@@ -462,16 +464,61 @@ class TestCacheHealth(Base):
         # paused = 2 -> the "paused 2" segment carries the 'bad' (red) pair
         eng.last_frame = self._sample(paused=2)
         scr = FakeScreen(40, 120)
-        nb.frame(scr, eng, graphs, False, c)
+        nb.frame(scr, eng, graphs, c)
         bad_attr = 1 + c["bad"]
         self.assertTrue(any("paused 2" in t and a == bad_attr
                             for (_, _, t, a) in scr.writes))
         # paused = 0 -> the same segment is painted with the default color
         eng.last_frame = self._sample(paused=0)
         scr = FakeScreen(40, 120)
-        nb.frame(scr, eng, graphs, False, c)
+        nb.frame(scr, eng, graphs, c)
         self.assertTrue(any("paused 0" in t and a == 0
                             for (_, _, t, a) in scr.writes))
+
+    def test_G10_status_line_shows_context_window_in_kitok(self):
+        # 131072 tokens = 128.0 KiToks (1 KiToks = 1024 tokens)
+        nb.curses.color_pair = lambda i: 1 + i
+        c = {"ok": 1, "bad": 2, "toks": 3, "dim": 4, "kv": 5, "title": 6,
+             "batch": 7, "label": 8, "val": 9, "peak": 10}
+        nb.CALIB = dict(CALIB_OK)
+        eng = make_engine(True)
+        eng.m = {"ninfer_engine_ready": 1.0}
+        eng.last_frame = self._sample(ctx_window=131072)
+        eng.start_time = None
+        graphs = {k: nb.Graph(60) for k in ("batch", "toks", "prefill")}
+        scr = FakeScreen(40, 120)
+        nb.frame(scr, eng, graphs, c)
+        row1 = "".join(t for (y, x, t, a) in scr.writes if y == 1)
+        self.assertIn("calibrated in", row1)
+        self.assertIn("ctx 128.0 KiToks", row1)
+
+    def test_G11_no_ctx_metric_no_ctx_segment(self):
+        nb.curses.color_pair = lambda i: 1 + i
+        c = {"ok": 1, "bad": 2, "toks": 3, "dim": 4, "kv": 5, "title": 6,
+             "batch": 7, "label": 8, "val": 9, "peak": 10}
+        nb.CALIB = dict(CALIB_OK)
+        eng = make_engine(True)
+        eng.m = {"ninfer_engine_ready": 1.0}
+        eng.last_frame = self._sample()  # no ctx_window key
+        eng.start_time = None
+        graphs = {k: nb.Graph(60) for k in ("batch", "toks", "prefill")}
+        scr = FakeScreen(40, 120)
+        nb.frame(scr, eng, graphs, c)
+        row1 = "".join(t for (y, x, t, a) in scr.writes if y == 1)
+        self.assertIn("calibrated in", row1)
+        self.assertNotIn("KiToks", row1)
+
+    def test_G12_no_calib_status_line_is_the_ctx_window(self):
+        nb.CALIB = None
+        eng = make_engine(True)
+        eng.m = {"ninfer_engine_ready": 1.0}
+        eng.last_frame = self._sample(ctx_window=131072)
+        eng.start_time = None
+        graphs = {k: nb.Graph(60) for k in ("batch", "toks", "prefill")}
+        scr = FakeScreen(40, 120)
+        nb.frame(scr, eng, graphs, {})
+        row1 = "".join(t for (y, x, t, a) in scr.writes if y == 1)
+        self.assertIn("128.0 KiToks", row1)
 
     def test_G8_explicit_bytes_per_tok_works_without_calibration(self):
         # --bytes-per-tok without calibration data: CALIB has no "ok" key,
@@ -554,7 +601,7 @@ class TestXferSpillRecall(Base):
         graphs["xfer_d2h"] = d2h
         graphs["xfer_h2d"] = h2d
         scr = FakeScreen(40, 120)
-        nb.frame(scr, eng, graphs, False, c)
+        nb.frame(scr, eng, graphs, c)
         self.assertTrue(rows_with(scr, "Spill"))
         self.assertTrue(rows_with(scr, "Recall"))
         spill = next(t for (_, _, t, _) in scr.writes if "Spill" in t)
@@ -603,7 +650,7 @@ class TestBatchHeight(Base):
         eng.last_frame = self._sample()
         graphs = {"batch": nb.Graph(60, floor=floor),
                   "toks": nb.Graph(60), "prefill": nb.Graph(60)}
-        nb.frame(scr, eng, graphs, False, {})
+        nb.frame(scr, eng, graphs, {})
         b = min(rows_with(scr, "Batch size"))
         p = min(rows_with(scr, "Prefill t/s"))
         # title row + N graph rows + baseline row, then the next panel title

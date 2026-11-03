@@ -51,7 +51,7 @@ Usage:
       [--burst N] [--bytes-per-tok N] [--pricing-model KEY] [--pricing-file PATH]
 
 Keys in TUI mode:
-  q / Esc  quit        s  pause/resume polling        r  reset graph auto-scale
+  q / Esc  quit
 """
 
 import argparse
@@ -649,6 +649,7 @@ class Engine:
                 "decode_ready": g(m, "ninfer_requests_decode_ready", 0.0),
                 "ready": g(m, "ninfer_engine_ready", 0.0),
                 "max_concurrency": g(m, "ninfer_max_concurrency", 0.0),
+                "ctx_window": g(m, "ninfer_max_context_tokens", 0.0),
                 "util": util,
                 "tok_hit": tok_hit,
                 "req_hit": req_hit,
@@ -676,7 +677,6 @@ class Graph:
 
     def __init__(self, width, floor=0.0, fixed=False):
         self.hist = deque(maxlen=width)
-        self.scale = None  # None => autoscale to window max
         self.floor = floor  # autoscale never goes below this (e.g. max_concurrency)
         self.fixed = fixed  # True: scale is pinned to floor, no autoscale
 
@@ -698,15 +698,7 @@ class Graph:
         # known, fall back to the window max so early samples still render
         if self.fixed and self.floor > 0:
             return self.floor
-        if self.scale is not None:
-            return max(m, self.scale)
         return max(m, self.floor)
-
-    def set_autoscale(self):
-        self.scale = None
-
-    def set_fixed_scale(self, v):
-        self.scale = max(v, 1e-9)
 
 
 # ---------------------------------------------------------------- text mode
@@ -733,6 +725,9 @@ def run_text(url, rates=None, label=None):
     print(f"engine : {url}  ({'ready' if s['ready'] else 'not ready'})")
     if eng.model:
         print(f"model  : {eng.model}")
+    if s.get("ctx_window"):
+        cw = s["ctx_window"]
+        print(f"context: {cw:,.0f} tok  ({cw / 1024:.1f} KiToks)")
     print(f"batch  : running={s['running']:.0f} waiting={s['waiting']:.0f} "
           f"prefilling={s['prefilling']:.0f} decode_ready={s['decode_ready']:.0f}")
     print(f"input  : {human(s['input_total'])} tokens total "
@@ -1005,7 +1000,7 @@ def draw_bar_graph(scr, y, graph: Graph, rows, width, key, c):
     return y + rows + 1
 
 
-def frame(scr, eng, graphs, paused, c):
+def frame(scr, eng, graphs, c):
     scr.erase()
     try:
         max_y, max_x = scr.getmaxyx()
@@ -1025,8 +1020,6 @@ def frame(scr, eng, graphs, paused, c):
     status = "READY" if (eng.ok and s and s["ready"]) else ("DOWN" if not eng.ok else "BUSY")
     status_key = "ok" if status == "READY" else "bad"
     head = f"ninfer btop ─ {model} ─ engine: {status} ─ up {uptime} ─ {eng.url}"
-    if paused:
-        head += "  [paused]"
     try:
         # never fill the last column: a cursor parked at EOL puts ncurses in
         # pending-wrap state and its relative row moves land 1-2 rows low
@@ -1034,17 +1027,24 @@ def frame(scr, eng, graphs, paused, c):
     except curses.error:
         pass
 
+    # status line (row 1): calibration figures, plus the engine's context
+    # window in KiToks (1 KiToks = 1024 tokens) when the engine reports it
+    ctx = (s or {}).get("ctx_window")
+    ctx_txt = f"{ctx / 1024:.1f} KiToks" if ctx else ""
     if CALIB and CALIB.get("ok"):
         cd = CALIB
         peak_attr = (curses.color_pair(c["peak"]) | curses.A_BOLD) if "peak" in c else curses.A_REVERSE
         lbl = curses.color_pair(c.get("label", 0))
+        segs = [(f"calibrated in {cd['duration']:.1f}s:  concurrency ", lbl),
+                (f"{cd['concurrency']}", peak_attr),
+                ("  ·  prefill ", lbl),
+                (f"{cd['prefill_tps']:,.0f} t/s", peak_attr),
+                ("  ·  decode ", lbl),
+                (f"{cd['decode_tps']:,.0f} t/s", peak_attr)]
+        if ctx_txt:
+            segs += [("  ·  ctx ", lbl), (ctx_txt, peak_attr)]
         x = 0
-        for txt, a in ((f"calibrated in {cd['duration']:.1f}s:  concurrency ", lbl),
-                       (f"{cd['concurrency']}", peak_attr),
-                       ("  ·  prefill ", lbl),
-                       (f"{cd['prefill_tps']:,.0f} t/s", peak_attr),
-                       ("  ·  decode ", lbl),
-                       (f"{cd['decode_tps']:,.0f} t/s", peak_attr)):
+        for txt, a in segs:
             n = min(len(txt), width - x)
             if n <= 0:
                 break
@@ -1054,18 +1054,22 @@ def frame(scr, eng, graphs, paused, c):
                 break
             x += n
     elif CALIB and CALIB.get("error"):
+        msg = f"calibration failed: {CALIB['error'][:width - 25]}  (util n/a)"
+        if ctx_txt:
+            msg += f"  ·  ctx {ctx_txt}"
         try:
-            scr.addnstr(1, 0, f"calibration failed: {CALIB['error'][:width - 25]}  (util n/a)",
-                        width - 1, curses.color_pair(c.get("dim", 0)))
+            scr.addnstr(1, 0, msg[:width - 1], width - 1, curses.color_pair(c.get("dim", 0)))
+        except curses.error:
+            pass
+    elif ctx_txt:
+        # no calibration data: the status line still carries the context window
+        try:
+            scr.addnstr(1, 0, ctx_txt, width - 1, curses.color_pair(c.get("dim", 0)))
         except curses.error:
             pass
 
-    # first free row below the header block (header is row 0); the calibration
-    # line (or its failed message) is row 1 and util now lives only in the footer
-    if CALIB is not None:
-        y = 2          # header + calibration / "calibration failed" line
-    else:
-        y = 1          # header only (no calibration data)
+    # row 0 header, row 1 status line; the panels start on row 2
+    y = 2
     if not eng.ok:
         # the banner sits below the header/calibration block and pushes the
         # panels down instead of sharing their rows
@@ -1078,11 +1082,11 @@ def frame(scr, eng, graphs, paused, c):
         y += 2
     g_batch = graphs["batch"]
     g_toks = graphs["toks"]
-    # fixed rows: header (2 if calibrated else 1) + 3 titles + 3 baselines
+    # fixed rows: header + status line + 3 titles + 3 baselines
     # + 1 lane + 1 totals title + 2 totals + 1 shared Device KV/Host KV/Cache
     # title + 4 shared rows (incl. the spill/recall bars) + 1 footer; the
     # cur/min/max/avg figures sit in the panel titles, plots take the rest
-    fixed = 18 if CALIB is not None else 17
+    fixed = 18
     # the batch panel's height follows the engine's max concurrency (kept in
     # Graph.floor, updated on every poll): one braille character resolves 4
     # dot levels, so N concurrent requests need ceil(N/4) characters
@@ -1225,7 +1229,7 @@ def frame(scr, eng, graphs, paused, c):
     else:
         stext, skey = "", "dim"
     x = 0
-    for txt, key in ((" q quit·s pause·r reset scale", "dim"),
+    for txt, key in ((" q quit", "dim"),
                      (utext, ukey),
                      (stext, skey)):
         if x >= width:
@@ -1258,7 +1262,6 @@ def main_loop(stdscr, args):
               "xfer_d2h": Graph(13), "xfer_h2d": Graph(13)}
     interval = args.interval / 1000.0
     eng = Engine(args.url, interval, args.pricing_rates, label=args.pricing_model)
-    paused = False
     last_poll = 0.0
     running = True
 
@@ -1267,7 +1270,7 @@ def main_loop(stdscr, args):
         # one sample per character: each poll appends exactly one character,
         # so redrawing after every poll shifts the graph by exactly one
         # character - there is no pair phase to flip, it cannot jump
-        if not paused and now - last_poll >= interval:
+        if now - last_poll >= interval:
             last_poll = now
             s = eng.poll()
             eng.last_frame = s
@@ -1282,7 +1285,7 @@ def main_loop(stdscr, args):
             else:
                 for k in graphs:
                     graphs[k].add_blank()
-            frame(stdscr, eng, graphs, paused, c)
+            frame(stdscr, eng, graphs, c)
 
         # resync graph width on terminal resize
         ny, nx = stdscr.getmaxyx()
@@ -1293,7 +1296,7 @@ def main_loop(stdscr, args):
                 g2 = Graph(gwidth, floor=graphs[k].floor, fixed=graphs[k].fixed)
                 g2.hist.extend(old[-gwidth:])
                 graphs[k] = g2
-            frame(stdscr, eng, graphs, paused, c)
+            frame(stdscr, eng, graphs, c)
 
         ch = stdscr.getch()
         if ch == -1:
@@ -1302,13 +1305,6 @@ def main_loop(stdscr, args):
             continue
         if ch in (ord("q"), ord("Q"), 27):
             running = False
-        elif ch == ord("s"):
-            paused = not paused
-            frame(stdscr, eng, graphs, paused, c)
-        elif ch == ord("r"):
-            graphs["batch"].set_autoscale()
-            graphs["toks"].set_autoscale()
-            frame(stdscr, eng, graphs, paused, c)
 
     return 0
 

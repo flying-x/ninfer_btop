@@ -85,7 +85,7 @@ python3 ninfer_btop.py --url URL [-i INTERVAL_MS] [--text] [--re-calib]
 - `--pricing-model KEY`  cloud-API pricing row to use — a model key from `pricing.yaml` (default `qwen3.8-27b`)
 - `--pricing-file PATH`  use a different pricing YAML file (default: `pricing.yaml` next to the script)
 
-Keys in TUI mode: `q`/Esc quit · `s` pause/resume polling · `r` reset graph auto-scale.
+Keys in TUI mode: `q`/Esc quit.
 The app ignores SIGTTOU, so it also works as a background job.
 
 ## Startup calibration & utilization
@@ -102,7 +102,9 @@ forces a fresh benchmark:
 2. **decode** — `--burst` parallel requests; `max decode t/s` = peak inter-sample rate of
    `ninfer_generation_tokens_total`, and `max concurrency` = peak of `ninfer_requests_running`
 
-The results are shown on row 1 of the UI (the three max values are highlighted).
+The results are shown on the UI's status line (row 1, the three max values
+highlighted); when the engine reports `ninfer_max_context_tokens` the engine's
+context window is appended there as well, in **KiToks** (1 KiToks = 1024 tokens).
 Utilization is shown live only in the footer: ` UTIL 2.6%  ≈$11 saved vs qwen3.8-27b Cloud API ` (the label is the selected `--pricing-model` key).
 
     UTIL = (prefill time + decode time) / uptime
