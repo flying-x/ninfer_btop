@@ -7,6 +7,7 @@ Run:  python3 -m unittest -v test_ninfer_btop
 """
 import contextlib
 import io
+import json
 import os
 import sys
 import tempfile
@@ -95,11 +96,13 @@ CALIB_OK = {"ok": True, "concurrency": 8, "prefill_tps": 100.0,
 class Base(unittest.TestCase):
     def setUp(self):
         self._real_urlopen = nb.urllib.request.urlopen
+        self._real_calib_file = nb.CALIB_FILE
         nb.CALIB = None
         stub_curses()
 
     def tearDown(self):
         nb.urllib.request.urlopen = self._real_urlopen
+        nb.CALIB_FILE = self._real_calib_file
         nb.CALIB = None
 
     def _sample(self, **over):
@@ -471,8 +474,8 @@ class TestCacheHealth(Base):
                             for (_, _, t, a) in scr.writes))
 
     def test_G8_explicit_bytes_per_tok_works_without_calibration(self):
-        # --bytes-per-tok with --no-calib: CALIB has no "ok" key, the split
-        # still works and utilization stays n/a
+        # --bytes-per-tok without calibration data: CALIB has no "ok" key,
+        # the split still works and utilization stays n/a
         nb.CALIB = {"bytes_per_tok": 1000.0}
         body = ("ninfer_engine_ready 1\n"
                 "ninfer_prompt_tokens_total 1000000\n"
@@ -714,7 +717,7 @@ class TestPricingLoader(Base):
 
     def test_I4_missing_key_errors_and_lists_available(self):
         path = self._write_yaml(self.SAMPLE)
-        sys.argv = ["ninfer_btop.py", "--url", "http://x", "--no-calib",
+        sys.argv = ["ninfer_btop.py", "--url", "http://x",
                     "--text", "--pricing-file", path,
                     "--pricing-model", "does-not-exist"]
         try:
@@ -766,6 +769,143 @@ class TestPricingLoader(Base):
                          {"input": 0.6, "cached_input": 0.06, "output": 3.6})
         self.assertEqual(p["qwen3.6-35b-a3b"],
                          {"input": 0.375, "cached_input": 0.0375, "output": 2.25})
+
+
+# ------------------------------- K. calibration cache (~/.ninfer_btop.json)
+
+class TestCalibCache(Base):
+    """K: the startup calibration is cached in ~/.ninfer_btop.json and
+    reused only while the engine's URL and server start time are unchanged;
+    --re-calib drops the cache and always benchmarks."""
+
+    URL = "http://x/metrics"
+    GOOD = {"ok": True, "model": "m", "concurrency": 4,
+            "prefill_tps": 100.0, "decode_tps": 50.0, "duration": 10.0,
+            "server_start_time": 1000.0}
+
+    def _cache_file(self):
+        nb.CALIB_FILE = tempfile.mktemp(suffix=".json")
+        return nb.CALIB_FILE
+
+    def _write_cache(self, url, start, path):
+        with open(path, "w") as f:
+            json.dump({"url": url, "server_start_time": start, "model": "m",
+                       "concurrency": 4, "prefill_tps": 100.0,
+                       "decode_tps": 50.0, "duration": 10.0}, f)
+
+    def test_K1_no_file_benchmarks_and_caches(self):
+        path = self._cache_file()
+        nb.resolve_calib(self.URL, run=lambda: setattr(nb, "CALIB", dict(self.GOOD)),
+                         probe=lambda u: 1000.0)
+        self.assertEqual(nb.CALIB, self.GOOD)
+        j = json.load(open(path))
+        self.assertEqual(j["url"], self.URL)
+        self.assertEqual(j["server_start_time"], 1000.0)
+        self.assertEqual(j["concurrency"], 4)
+
+    def test_K2_matching_start_time_reuses_cache_without_benchmark(self):
+        path = self._cache_file()
+        self._write_cache(self.URL, 1000.0, path)
+        ran = []
+        nb.resolve_calib(self.URL, run=lambda: ran.append(1), probe=lambda u: 1000.0)
+        self.assertEqual(ran, [])
+        self.assertTrue(nb.CALIB["ok"])
+        self.assertEqual(nb.CALIB["concurrency"], 4)
+        self.assertNotIn("server_start_time", nb.CALIB)  # cache dict shape
+
+    def test_K3_restarted_engine_benchmarks_and_rewrites_cache(self):
+        path = self._cache_file()
+        self._write_cache(self.URL, 1000.0, path)
+        def run():
+            c = dict(self.GOOD)
+            c["server_start_time"] = 2000.0
+            nb.CALIB = c
+        nb.resolve_calib(self.URL, run=run, probe=lambda u: 2000.0)
+        self.assertEqual(nb.CALIB["server_start_time"], 2000.0)
+        self.assertEqual(json.load(open(path))["server_start_time"], 2000.0)
+
+    def test_K4_re_calib_drops_cache_and_always_benchmarks(self):
+        path = self._cache_file()
+        self._write_cache(self.URL, 1000.0, path)
+        ran = []
+        def run():
+            ran.append(1)
+            nb.CALIB = dict(self.GOOD)
+        # start time still matches - only the flag forces the fresh run
+        nb.resolve_calib(self.URL, re_calib=True, run=run, probe=lambda u: 1000.0)
+        self.assertEqual(ran, [1])
+        # the dropped cache is rewritten with the fresh result
+        self.assertEqual(json.load(open(path))["url"], self.URL)
+
+    def test_K5_different_url_benchmarks(self):
+        path = self._cache_file()
+        self._write_cache("http://y/metrics", 1000.0, path)
+        ran = []
+        nb.resolve_calib(self.URL, run=lambda: ran.append(1) or setattr(nb, "CALIB", {"ok": False}),
+                         probe=lambda u: 1000.0)
+        self.assertEqual(ran, [1])
+
+    def test_K6_failed_calibration_is_not_cached(self):
+        path = self._cache_file()
+        nb.resolve_calib(self.URL,
+                         run=lambda: setattr(nb, "CALIB", {"ok": False, "error": "boom"}),
+                         probe=lambda u: None)
+        self.assertFalse(os.path.exists(path))
+
+    def test_K7_undeletable_cache_aborts(self):
+        # a directory where the cache file should be: os.remove raises
+        # IsADirectoryError - must abort, not leave the stale cache in place
+        d = tempfile.mkdtemp()
+        nb.CALIB_FILE = d
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit) as ctx:
+                nb.resolve_calib(self.URL, re_calib=True,
+                                 run=lambda: setattr(nb, "CALIB", dict(self.GOOD)),
+                                 probe=lambda u: 1000.0)
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("cannot remove", err.getvalue())
+
+    def test_K8_unwritable_cache_aborts_after_benchmark(self):
+        d = tempfile.mkdtemp()
+        nb.CALIB_FILE = os.path.join(d, "no", "such", "cache.json")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit) as ctx:
+                nb.resolve_calib(self.URL,
+                                 run=lambda: setattr(nb, "CALIB", dict(self.GOOD)),
+                                 probe=lambda u: 1000.0)
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("cannot write", err.getvalue())
+
+    def test_K9_unreadable_cache_aborts_before_benchmark(self):
+        d = tempfile.mkdtemp()
+        nb.CALIB_FILE = d  # open-for-read on a directory raises IsADirectoryError
+        ran = []
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit) as ctx:
+                nb.resolve_calib(self.URL, run=lambda: ran.append(1),
+                                 probe=lambda u: 1000.0)
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertEqual(ran, [])  # no benchmark spent on a doomed run
+        self.assertIn("cannot read", err.getvalue())
+
+    def test_K10_corrupt_cache_self_heals(self):
+        path = self._cache_file()
+        with open(path, "w") as f:
+            f.write("not json")
+        ran = []
+        def run():
+            ran.append(1)
+            nb.CALIB = dict(self.GOOD)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            nb.resolve_calib(self.URL, run=run, probe=lambda u: 1000.0)
+        self.assertEqual(ran, [1])
+        self.assertIn("not valid JSON", err.getvalue())
+        j = json.load(open(path))  # the fresh run rewrote the corrupt file
+        self.assertEqual(j["url"], self.URL)
 
 
 if __name__ == "__main__":

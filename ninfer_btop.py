@@ -33,9 +33,11 @@ Polls the engine's Prometheus metrics endpoint and renders:
 
 On startup the script benchmarks the engine: one large uncached prompt
 (max prefill t/s) and an 8-way parallel burst (max decode t/s and the
-effective max concurrency). Use --no-calib to skip the benchmark. The
-device/host tier split of the token hit needs --bytes-per-tok (exact
-context bytes per token, see bytes_per_token.md).
+effective max concurrency). The result is cached in ~/.ninfer_btop.json and
+reused on the next start while the engine's start time is unchanged (a
+restart re-benchmarks automatically); --re-calib drops the cache and forces
+a fresh benchmark. The device/host tier split of the token hit needs
+--bytes-per-tok (exact context bytes per token, see bytes_per_token.md).
 
 Standard library only (curses + urllib). No packages to install.
 
@@ -45,7 +47,7 @@ next to this script; select which model's row to use with --pricing-model
 row is used instead.
 
 Usage:
-  python3 ninfer_btop.py --url URL [-i INTERVAL_MS] [--text] [--no-calib]
+  python3 ninfer_btop.py --url URL [-i INTERVAL_MS] [--text] [--re-calib]
       [--burst N] [--bytes-per-tok N] [--pricing-model KEY] [--pricing-file PATH]
 
 Keys in TUI mode:
@@ -385,7 +387,8 @@ def calibrate(url, log=print, burst=8):
 
     return {"ok": True, "model": model, "concurrency": concurrency,
             "prefill_tps": prefill_tps, "decode_tps": decode_tps,
-            "duration": duration}
+            "duration": duration,
+            "server_start_time": g(m0, "ninfer_server_start_time_seconds")}
 
 
 def run_calibration(args):
@@ -403,6 +406,102 @@ def run_calibration(args):
     print(f"  done in {c['duration']:.1f}s: max concurrency {c['concurrency']}  ·  "
           f"prefill {c['prefill_tps']:,.0f} t/s  ·  decode {c['decode_tps']:,.0f} t/s",
           flush=True)
+
+
+CALIB_FILE = os.path.expanduser("~/.ninfer_btop.json")
+
+
+def server_start_time(url):
+    """The engine's start time (epoch seconds) as reported by /metrics;
+    None when the endpoint or the metric is unavailable."""
+    try:
+        m = fetch_metrics(url)
+    except (OSError, ValueError):
+        return None
+    return g(m, "ninfer_server_start_time_seconds")
+
+
+def load_calib_cache(url, probe=server_start_time):
+    """The cached calibration from ~/.ninfer_btop.json. Valid only while the
+    same engine runs: the cache and the live endpoint must agree on the URL
+    and the server start time (a restart is a new engine). Returns the
+    cached CALIB dict, or None to force a fresh benchmark."""
+    try:
+        with open(CALIB_FILE) as f:
+            j = json.load(f)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        # a cache that exists but cannot be read will not be overwritable
+        # either: fail now, before spending minutes on a fresh benchmark
+        print(f"error: cannot read calibration cache {CALIB_FILE}: {e}",
+              file=sys.stderr)
+        sys.exit(1)
+    except ValueError as e:
+        # corrupt cache: re-benchmark and let the fresh run rewrite it
+        print(f"note: calibration cache {CALIB_FILE} is not valid JSON "
+              f"({e}); re-benchmarking", file=sys.stderr)
+        return None
+    if j.get("url") != url:
+        return None
+    st = probe(url)
+    cached = j.get("server_start_time")
+    if st is None or not cached or st != cached:
+        return None
+    c = {k: j[k] for k in ("model", "concurrency", "prefill_tps", "decode_tps",
+                           "duration") if k in j}
+    c["ok"] = True  # only successful calibrations are ever cached
+    return c
+
+
+def save_calib_cache(url, calib):
+    """Persist a successful calibration for the next startup; a failed
+    benchmark is never cached."""
+    st = calib.get("server_start_time")
+    if not st:
+        return
+    try:
+        with open(CALIB_FILE, "w") as f:
+            json.dump({"url": url, "server_start_time": st,
+                       **{k: calib[k] for k in ("model", "concurrency",
+                                                "prefill_tps", "decode_tps",
+                                                "duration") if k in calib}},
+                      f, indent=2)
+    except OSError as e:
+        # a silent failure would make the next start re-benchmark even
+        # though this run calibrated: surface it
+        print(f"error: cannot write calibration cache {CALIB_FILE}: {e}",
+              file=sys.stderr)
+        sys.exit(1)
+
+
+def resolve_calib(url, re_calib=False, run=run_calibration,
+                  probe=server_start_time):
+    """Decide where the startup calibration comes from: the
+    ~/.ninfer_btop.json cache when the engine's start time is unchanged, a
+    fresh benchmark otherwise. `re_calib` (the --re-calib flag) drops the
+    cache and always benchmarks. Sets the global CALIB and refreshes the
+    cache file after a successful run. A missing or corrupt cache simply
+    triggers a fresh benchmark; a cache file that exists but cannot be
+    read, written, or removed aborts with an error (silently falling back
+    would mislead the user about which calibration is in effect)."""
+    global CALIB
+    if re_calib:
+        try:
+            os.remove(CALIB_FILE)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            # swallowing this would leave the stale cache in place and make
+            # the re-calibration look like it was persisted
+            print(f"error: cannot remove calibration cache {CALIB_FILE}: {e}",
+                  file=sys.stderr)
+            sys.exit(1)
+    CALIB = None if re_calib else load_calib_cache(url, probe=probe)
+    if CALIB is None:
+        run()
+    if CALIB and CALIB.get("ok"):
+        save_calib_cache(url, CALIB)
 
 
 # ---------------------------------------------------------------- state
@@ -643,7 +742,7 @@ def run_text(url, rates=None, label=None):
     if u is not None:
         print(f"util   : {u * 100:5.1f}%  (est. (prefill time + decode time) / uptime, from startup calibration)")
     else:
-        print("util   : n/a  (benchmark skipped with --no-calib)")
+        print("util   : n/a  (no calibration data)")
     cc = s.get("cloud_cost")
     if cc is not None:
         print(f"saved  : ≈{money(cc)} vs {eng.cloud_label}  "
@@ -966,7 +1065,7 @@ def frame(scr, eng, graphs, paused, c):
     if CALIB is not None:
         y = 2          # header + calibration / "calibration failed" line
     else:
-        y = 1          # header only (--no-calib)
+        y = 1          # header only (no calibration data)
     if not eng.ok:
         # the banner sits below the header/calibration block and pushes the
         # panels down instead of sharing their rows
@@ -1221,8 +1320,10 @@ def main():
                 help="poll interval in ms (default 500); each poll shifts the "
                      "bar graphs by exactly one character")
     ap.add_argument("--text", action="store_true", help="one-shot plain-text stats, no TUI")
-    ap.add_argument("--no-calib", action="store_true",
-                    help="skip the startup benchmark (utilization shows n/a)")
+    ap.add_argument("--re-calib", action="store_true",
+                    help="drop the ~/.ninfer_btop.json calibration cache and "
+                         "re-run the startup benchmark (default: reuse the "
+                         "cache while the engine's start time is unchanged)")
     ap.add_argument("--bytes-per-tok", type=float, default=None, metavar="N",
                     help="context bytes per token for the device/host hit split "
                          "(exact value from the model architecture: full-attention "
@@ -1248,8 +1349,8 @@ def main():
         sys.exit(2)
     args.pricing_rates = pricing[args.pricing_model]
 
-    if not args.no_calib:
-        run_calibration(args)
+    resolve_calib(args.url, re_calib=args.re_calib,
+                  run=lambda: run_calibration(args))
     if args.bytes_per_tok:
         global CALIB
         CALIB = dict(CALIB or {})

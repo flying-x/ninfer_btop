@@ -60,7 +60,7 @@ Standard library only (curses + urllib). Nothing to install.
 ## Usage
 
 ```
-python3 ninfer_btop.py --url URL [-i INTERVAL_MS] [--text] [--no-calib]
+python3 ninfer_btop.py --url URL [-i INTERVAL_MS] [--text] [--re-calib]
     [--burst N] [--bytes-per-tok N] [--pricing-model KEY] [--pricing-file PATH]
 ```
 
@@ -68,7 +68,9 @@ python3 ninfer_btop.py --url URL [-i INTERVAL_MS] [--text] [--no-calib]
 - `-i`      poll interval in ms (default 500); each poll shifts the bar graphs by
   exactly one character
 - `--text`  one-shot plain-text stats, no TUI
-- `--no-calib`  skip the startup benchmark (utilization shows n/a)
+- `--re-calib`  drop the `~/.ninfer_btop.json` calibration cache and re-run the
+  startup benchmark (by default the cache is reused while the engine's start time
+  is unchanged — a restarted engine re-benchmarks automatically)
 - `--bytes-per-tok N`  exact context bytes per token for the device/host hit
   split, computed from the model architecture: full-attention layers x 2
   (K+V) x kv_heads x (head_dim x dtype_bytes + scale overhead) — INT8
@@ -88,8 +90,12 @@ The app ignores SIGTTOU, so it also works as a background job.
 
 ## Startup calibration & utilization
 
-On startup (TUI and `--text` alike, unless `--no-calib`) the script benchmarks the
-engine (tens of seconds, depending on engine load — 74 s on the default engine):
+On startup (TUI and `--text` alike) the script benchmarks the
+engine (tens of seconds, depending on engine load — 74 s on the default engine),
+unless a valid calibration cache is available. The result is cached in
+`~/.ninfer_btop.json` together with the engine's start time and reused on the
+next start while that start time is unchanged; `--re-calib` drops the cache and
+forces a fresh benchmark:
 
 1. **prefill** — one large uncached prompt; `max prefill t/s` = prefill tokens ÷ time to
    first generated token
