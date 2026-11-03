@@ -8,10 +8,9 @@ Polls the engine's Prometheus `/metrics` endpoint and renders:
 
 - scrolling bar graph: **batch size** (`ninfer_requests_running`). The panel's height follows
   the engine's max concurrency: one braille character resolves 4 dot levels (4 concurrent
-  requests), so the graph is ceil(max_concurrency / 4) characters high. Its scale is pinned
-  to max_concurrency — one dot level is always exactly one request, the window max never
-  stretches the scale, and overload clips at the top — at ninfer's cap of 8 the panel is
-  1 or 2 characters high.
+  requests), so the graph is ceil(max_concurrency / 4) characters high. Its scale is the
+  panel's total dot count (4 or 8) — one dot level is always exactly one request, and
+  overload clips at the top — at ninfer's cap of 8 the panel is 1 or 2 characters high.
 - scrolling bar graph: **prefill t/s** (inter-poll rate of `ninfer_prefill_tokens_total` —
   prompt processing). While a request is prefilling, decode t/s is correctly 0 and the prefill
   graph shows the work; both rates drop to 0 as soon as the engine is idle.
@@ -20,7 +19,9 @@ Polls the engine's Prometheus `/metrics` endpoint and renders:
   The graphs scroll left to right (the newest sample enters at the left edge and bars
   exit on the right — deliberately unlike btop). Each braille character holds exactly
   one sample, drawn as a flat column of dots (never a rising/falling glyph), so each
-  poll shifts a graph by exactly one character — the motion can never jump.
+  poll shifts a graph by exactly one character — the motion can never jump. Each
+  sample maps to an integer dot height (rounded up, so any non-zero sample draws at
+  least one dot); the prefill/decode graphs autoscale to their own window peak.
 - token totals: input (prompt) / output (generation)
 - Device KV ∥ Host KV ∥ Cache (checkpoint reuse) — three panels side by side
   on one shared title row plus 4 content rows (btop-style). The two KV

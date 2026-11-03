@@ -669,27 +669,34 @@ class TestBatchHeight(Base):
     def test_J3_floor_preserved_on_resize_rebuild(self):
         g = nb.Graph(60, floor=8)
         g.add(3.0)
-        g2 = nb.Graph(40, floor=g.floor, fixed=g.fixed)
+        g2 = nb.Graph(40, floor=g.floor, pinned=g.pinned)
         g2.hist.extend(list(g.hist)[-40:])
         self.assertEqual(g2.floor, 8.0)
         self.assertEqual(list(g2.hist), list(g.hist)[-40:])
 
-    def test_J4_fixed_scale_never_stretches_to_window_max(self):
-        g = nb.Graph(10, floor=4, fixed=True)
-        for v in (1.0, 2.0, 8.0):  # a burst above max_concurrency
+    def test_J4_dots_pinned_to_plot_height(self):
+        # pinned: max = the plot's total dot count (4*rows) - 1 dot = 1
+        # request, a burst above the cap clips at the top
+        self.assertEqual(nb.compute_dots([1.0, 2.0, 8.0], max=8, total_dots=8), [1, 2, 8])
+        self.assertEqual(nb.compute_dots([1.0, 2.0, 11.0], max=8, total_dots=8), [1, 2, 8])
+        g = nb.Graph(10, floor=4, pinned=True)
+        for v in (1.0, 2.0, 8.0):
             g.add(v)
-        self.assertEqual(g.max_for_scale(), 4.0)  # pinned: 1 dot = 1 request
-        # before the anchor is known (floor 0) it falls back to the window max
-        g0 = nb.Graph(10, floor=0.0, fixed=True)
+        self.assertEqual(g.dots(2), [1, 2, 8])
+        # plain graphs autoscale to the window max
+        g0 = nb.Graph(10)
+        g0.add(1.0)
         g0.add(3.0)
-        self.assertEqual(g0.max_for_scale(), 3.0)
-        # plain graphs still autoscale as before
-        gp = nb.Graph(10)
-        gp.add(3.0)
-        self.assertEqual(gp.max_for_scale(), 3.0)
+        self.assertEqual(g0.dots(1), [2, 4])
+        # floor no longer touches the scale of plain graphs (it only sizes
+        # the batch panel); autoscale still takes the window max
         gp2 = nb.Graph(10, floor=4)
         gp2.add(1.0)
-        self.assertEqual(gp2.max_for_scale(), 4.0)  # floor still floors autoscale
+        gp2.add(3.0)
+        self.assertEqual(gp2.dots(1), [2, 4])
+        # ceil: any non-zero sample draws at least one dot; Nones stay blank
+        self.assertEqual(nb.compute_dots([0.1, 1.0]), [1, 4])
+        self.assertEqual(nb.compute_dots([None, 0.0, 2.0]), [0, 0, 4])
 
 
 # ------------------------------------- I. pricing loader + row selection

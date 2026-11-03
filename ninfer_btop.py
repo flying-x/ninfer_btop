@@ -5,10 +5,10 @@ Polls the engine's Prometheus metrics endpoint and renders:
   * scrolling bar graph: batch size  (ninfer_requests_running)
     (height follows the engine's max concurrency: one braille character
     resolves 4 dot levels = 4 concurrent requests, so the panel is
-    ceil(max_concurrency/4) chars high. The scale is pinned to
-    max_concurrency - one dot level is always one request, the window max
-    never stretches it, and overload clips at the top; for ninfer's cap
-    of 8 the panel is 1 or 2 chars high)
+    ceil(max_concurrency/4) chars high. The scale is the panel's total
+    dot count (4 or 8, from the height) - one dot level is always one
+    request, and overload clips at the top; for ninfer's cap of 8 the
+    panel is 1 or 2 chars high)
   * scrolling bar graph: prefill t/s (rate of ninfer_prefill_tokens_total)
   * scrolling bar graph: decode t/s  (rate of ninfer_generation_tokens_total)
     (btop's braille glyphs: one sample per character - a flat column of
@@ -55,8 +55,10 @@ Keys in TUI mode:
 """
 
 import argparse
+import builtins
 import curses
 import json
+import math
 import os
 import random
 import signal
@@ -670,15 +672,16 @@ class Graph:
     character, so a redraw after each poll shifts the graph by exactly one
     character - it can never jump.
 
-    `fixed` graphs pin their scale to `floor` (e.g. the engine's
-    max_concurrency for the batch graph): each unit of value is always
-    exactly one dot level, the window max never stretches the scale, and
-    values above the anchor clip at the top of the plot."""
+    `pinned` graphs (the batch graph) map their samples against the plot's
+    total dot count (4*rows, from the panel height): one dot level is
+    always exactly one request, and overload clips at the top of the plot.
+    `floor` is the engine's max_concurrency, which sizes the panel height.
+    Other graphs autoscale to the window max."""
 
-    def __init__(self, width, floor=0.0, fixed=False):
+    def __init__(self, width, floor=0.0, pinned=False):
         self.hist = deque(maxlen=width)
-        self.floor = floor  # autoscale never goes below this (e.g. max_concurrency)
-        self.fixed = fixed  # True: scale is pinned to floor, no autoscale
+        self.floor = floor  # engine max_concurrency (sizes the batch panel)
+        self.pinned = pinned  # True: scale is the plot's total dot count
 
     def add(self, v):
         self.hist.append(None if v is None else max(0.0, float(v)))
@@ -690,15 +693,14 @@ class Graph:
     def values(self):
         return [v for v in self.hist if v is not None]
 
-    def max_for_scale(self):
-        vals = self.values
-        m = max(vals) if vals else 0.0
-        # pinned scale: the anchor is the whole scale - the window max never
-        # stretches it (overshoots clip at the top); before the anchor is
-        # known, fall back to the window max so early samples still render
-        if self.fixed and self.floor > 0:
-            return self.floor
-        return max(m, self.floor)
+    def dots(self, rows=1):
+        """Dot heights (0..4*rows) for the current window of a `rows`-char
+        plot: pinned graphs scale against the plot's total dot count, the
+        rest autoscale to the window max."""
+        total = 4 * rows
+        return compute_dots(list(self.hist),
+                            max=total if self.pinned else None,
+                            total_dots=total)
 
 
 # ---------------------------------------------------------------- text mode
@@ -899,12 +901,13 @@ def _xfer_row(label, graph, width=13):
         return label + " " * (width + 1) + "—"
     hist = list(graph.hist)
     n = min(width, len(hist))
-    mx = graph.max_for_scale()
+    dots = compute_dots(hist, total_dots=4)  # autoscale to its own window peak
+    vals = [v for v in hist if v is not None]
+    mx = max(vals) if vals else 0.0
     cells = []
     for col in range(n):
         i = n - 1 - col  # leftmost character = newest sample
-        l = _braille_level(hist[i], mx, 0, 1)
-        cells.append(BRAILLE[l][l])  # flat top: both dot columns at the same level
+        cells.append(BRAILLE[dots[i]][dots[i]])  # flat top: both dot columns at the same level
     spark = "".join(cells).ljust(width)  # partial window grows from the left edge
     return label + spark + " " + _rate_val(mx)
 
@@ -943,29 +946,28 @@ BRAILLE = (
 )
 
 
-def _braille_level(v, mx, r, rows):
-    """Braille cell level (0..4) a sample reaches in text row r (0 = top) of
-    a `rows`-row plot. Mirrors btop's Graphs::_create: 4 when the sample is
-    at/above the band top of that row, 0 at/below the band bottom, else the
-    4-step fraction of the band with btop's rounding bias (0.1, or 0.3 when
-    the plot is a single row). v is autoscaled against mx."""
-    if v is None or mx <= 0:
-        return 0
-    pct = min(100.0, v / mx * 100.0)
-    high = 100.0 * (rows - r) / rows
-    low = 100.0 * (rows - r - 1) / rows
-    if pct >= high:
-        return 4
-    if pct <= low:
-        return 0
-    mod = 0.3 if rows == 1 else 0.1
-    return max(0, min(4, int(round((pct - low) * 4 / (high - low) + mod))))
+def compute_dots(samples, max=None, total_dots=4):
+    """Dot heights (0..total_dots) for the samples of a bar graph.
+
+    `max` is the value that fills the plot: the plot's total dot count for
+    pinned graphs (the batch graph - one dot = one request), or None to
+    autoscale to the window max (prefill/decode, spill/recall).
+    no_dots = ceil(v / (max / total_dots)): every non-zero sample draws at
+    least one dot, and overshoots clip at total_dots."""
+    if max is None:  # the parameter shadows the builtin max
+        vals = [v for v in samples if v is not None]
+        max = builtins.max(vals) if vals else 0.0
+    if max <= 0:
+        return [0] * len(samples)
+    step = max / total_dots
+    return [0 if v is None else min(total_dots, math.ceil(v / step))
+            for v in samples]
 
 
 def draw_bar_graph(scr, y, graph: Graph, rows, width, key, c):
     hist_vals = list(graph.hist)
+    dots = graph.dots(rows)  # one dot height per sample
     plot_w = min(width - 14, len(hist_vals))  # one sample per braille char
-    mx = graph.max_for_scale()
     peak_v = max((v for v in hist_vals if v is not None), default=0.0)
     base_attr = curses.color_pair(c.get(key, 0))
     # window-max samples are highlighted (bold peak color, or reverse video
@@ -977,16 +979,15 @@ def draw_bar_graph(scr, y, graph: Graph, rows, width, key, c):
     for col in range(plot_w):
         i = plot_w - 1 - col  # leftmost character = newest sample
         v = hist_vals[i]
+        d = dots[i]
         attr = peak_attr if (peak_v > 0 and v == peak_v) else base_attr
-        # band r is measured from the top of the plot (btop convention),
-        # so it maps to text row y + r - the bars fill up from the baseline
+        # a sample fills from the baseline up: text row y + r (r = 0 is the
+        # top of the plot) covers dot band [(rows-1-r)*4, (rows-r)*4)
         for r in range(rows):
-            # one sample per character: both dot columns at the same level,
-            # a flat top - never a rising/falling glyph
-            l = _braille_level(v, mx, r, rows)
-            ch = BRAILLE[l][l]
-            if ch == " ":
+            l = min(4, d - (rows - 1 - r) * 4)
+            if l <= 0:
                 continue
+            ch = BRAILLE[l][l]  # flat top: both dot columns at the same level
             try:
                 scr.addstr(y + r, 1 + col, ch, attr)
             except curses.error:
@@ -1090,10 +1091,13 @@ def frame(scr, eng, graphs, c):
     # the batch panel's height follows the engine's max concurrency (kept in
     # Graph.floor, updated on every poll): one braille character resolves 4
     # dot levels, so N concurrent requests need ceil(N/4) characters
-    # (<=4 -> 1 char, 5-8 -> 2, 9-12 -> 3, ...), which makes each dot level
-    # exactly one request. ninfer caps concurrency at 8, so its batch graph
-    # is 1 or 2 chars high. Before the first max-concurrency sample the
-    # panel falls back to the even three-way split of the remaining rows.
+    # (<=4 -> 1 char, 5-8 -> 2, 9-12 -> 3, ...). The panel's scale is its
+    # own total dot count (4*rows), which makes each dot level exactly one
+    # request. ninfer caps concurrency at 8, so its batch graph is 1 or 2
+    # chars high. Before the first successful poll (/metrics is unreachable
+    # until after the engine's warmup, and then max_concurrency is in every
+    # scrape) the panel height falls back to the even three-way split; the
+    # scale stays pinned to the height's dot count.
     if g_batch.floor > 0:
         rows_batch = max(1, min(6, -(-int(g_batch.floor) // 4)))
     else:
@@ -1255,7 +1259,7 @@ def main_loop(stdscr, args):
     max_y, max_x = stdscr.getmaxyx()
     gwidth = max(20, max_x - 16)
     # one sample per drawn character: histories are the column count
-    graphs = {"batch": Graph(gwidth, fixed=True),  # pinned: 1 dot level = 1 request
+    graphs = {"batch": Graph(gwidth, pinned=True),  # pinned: scale = plot's dot count (1 dot = 1 request)
               "toks": Graph(gwidth), "prefill": Graph(gwidth),
               # transfer sparklines: fixed 13-char width (13 samples ~ 6.5 s
               # at the default 500 ms poll), independent of terminal width
@@ -1293,7 +1297,7 @@ def main_loop(stdscr, args):
             gwidth = max(20, nx - 16)
             for k in ("batch", "toks", "prefill"):  # xfer sparklines stay 13 chars
                 old = list(graphs[k].hist)
-                g2 = Graph(gwidth, floor=graphs[k].floor, fixed=graphs[k].fixed)
+                g2 = Graph(gwidth, floor=graphs[k].floor, pinned=graphs[k].pinned)
                 g2.hist.extend(old[-gwidth:])
                 graphs[k] = g2
             frame(stdscr, eng, graphs, c)
