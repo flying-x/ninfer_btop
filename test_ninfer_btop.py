@@ -591,10 +591,10 @@ class TestXferSpillRecall(Base):
         eng.m = {"ninfer_engine_ready": 1.0}
         eng.last_frame = s
         eng.start_time = None
-        d2h = nb.Graph(13)
+        d2h = nb.Graph(26)
         for v in [0.0] * 10 + [200.0] * 4 + [0.0] * 12:
             d2h.add(v)
-        h2d = nb.Graph(13)
+        h2d = nb.Graph(26)
         for v in [0.0] * 24 + [30.0, 30.0]:
             h2d.add(v)
         graphs = {k: nb.Graph(60) for k in ("batch", "toks", "prefill")}
@@ -618,13 +618,13 @@ class TestXferSpillRecall(Base):
 
     def test_H4_sparkline_autoscale_and_empty(self):
         # all-zero window: blank sparkline, 0B/s label
-        g = nb.Graph(13)
+        g = nb.Graph(26)
         for _ in range(26):
             g.add(0.0)
         self.assertEqual(nb._xfer_row("  X  ", g),
                          "  X  " + " " * 13 + " " + "0B/s")
         # a burst autoscales against its own window peak, not a shared one
-        g2 = nb.Graph(13)
+        g2 = nb.Graph(26)
         for v in [0.0] * 11 + [5.0] * 4 + [0.0] * 11:
             g2.add(v)
         row = nb._xfer_row("  X  ", g2)

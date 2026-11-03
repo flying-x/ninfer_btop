@@ -17,11 +17,13 @@ Polls the engine's Prometheus `/metrics` endpoint and renders:
 - scrolling bar graph: **decode t/s** (inter-poll rate of `ninfer_generation_tokens_total`)
   (The engine publishes stats after every prefill/decode step, so both track live phase.)
   The graphs scroll left to right (the newest sample enters at the left edge and bars
-  exit on the right — deliberately unlike btop). Each braille character holds exactly
-  one sample, drawn as a flat column of dots (never a rising/falling glyph), so each
-  poll shifts a graph by exactly one character — the motion can never jump. Each
-  sample maps to an integer dot height (rounded up, so any non-zero sample draws at
-  least one dot); the prefill/decode graphs autoscale to their own window peak.
+  exit on the right — deliberately unlike btop). Each braille character holds two
+  adjacent samples — each sample is a single vertical dot line, the newer sample in
+  the left dot column, so a character may be a rising/falling glyph. Each poll
+  appends one sample and shifts every dot line by exactly half a character (one full
+  character per two polls) — the motion can never jump. Each sample maps to an
+  integer dot height (rounded up, so any non-zero sample draws at least one dot);
+  the prefill/decode graphs autoscale to their own window peak.
 - token totals: input (prompt) / output (generation)
 - Device KV ∥ Host KV ∥ Cache (checkpoint reuse) — three panels side by side
   on one shared title row plus 4 content rows (btop-style). The two KV
@@ -47,7 +49,7 @@ Polls the engine's Prometheus `/metrics` endpoint and renders:
   "Recall (h2d)" (host→device), read per-direction from
   `ninfer_context_transfer_bytes_total` (`direction="d2h"` / `"h2d"`). Each
   sparkline keeps ~6.5 s of history, autoscales to its own window peak
-  (shown as the side label for scale), and uses the same braille dots as the
+  (shown as the side label for scale), and uses the same braille dots and double-wide characters as the
   main graphs — so a few-millisecond recall burst that a one-poll bar would
   miss stays visible for the whole window, and host-tier shedding vs re-use
   is visible at a glance.

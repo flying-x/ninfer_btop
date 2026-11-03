@@ -11,11 +11,12 @@ Polls the engine's Prometheus metrics endpoint and renders:
     panel is 1 or 2 chars high)
   * scrolling bar graph: prefill t/s (rate of ninfer_prefill_tokens_total)
   * scrolling bar graph: decode t/s  (rate of ninfer_generation_tokens_total)
-    (btop's braille glyphs: one sample per character - a flat column of
-    dots, never a rising/falling glyph - and four vertical levels per text
-    line; the graphs scroll left to right: the newest sample enters at the
-    left edge, and each poll shifts a graph by exactly one character, so
-    the motion can never jump)
+    (btop's braille glyphs: two samples per character - each sample is a
+    single vertical dot line, the newer sample in the left dot column, so
+    a character may be a rising/falling glyph - and four vertical levels
+    per text line; the graphs scroll left to right: the newest sample
+    enters at the left edge, and each poll shifts every dot line by
+    exactly half a character, so the motion can never jump)
   * totals: input (prompt) / output (generation) tokens
   * Device KV / Host KV / Cache (checkpoint reuse): three side-by-side
     panels sharing one title row (btop-style). The KV columns show the
@@ -668,9 +669,10 @@ class Engine:
 
 class Graph:
     """Scrolling bar history. The newest sample sits at the left edge: bars
-    enter on the left and scroll out on the right. One sample per drawn
-    character, so a redraw after each poll shifts the graph by exactly one
-    character - it can never jump.
+    enter on the left and scroll out on the right. Two samples per drawn
+    character (the newer in the left dot line), so a redraw after each poll
+    shifts every dot line by exactly half a character - it can never jump,
+    and the buffer holds twice as many samples as the drawn column count.
 
     `pinned` graphs (the batch graph) map their samples against the plot's
     total dot count (4*rows, from the panel height): one dot level is
@@ -888,10 +890,10 @@ def draw_triple_panel(scr, y, left_title, mid_title, right_title, c, width):
 
 def _xfer_row(label, graph, width=13):
     """One cache-panel transfer row: a one-row braille sparkline over the
-    graph's window (the same dots as the main bar graphs, one sample per
-    character - a flat column of dots, never a rising/falling glyph),
-    autoscaled to its own window peak, with that peak as the side label for
-    scale. Unlike a one-poll bar, a sub-frame transfer burst (a few-MS
+    graph's window (the same dots and double-wide characters as the main
+    bar graphs - each character holds two adjacent samples, the newer in
+    the left dot line), autoscaled to its own window peak, with that peak
+    as the side label for scale. Unlike a one-poll bar, a sub-frame transfer burst (a few-MS
     recall DMA) stays visible for the whole graph window. The row is label
     + width + 1 + the peak label, which at 120 cols fits the ⅓-width cache
     column with the longest label (…MB/s, 10 chars). Like the main graphs
@@ -900,15 +902,14 @@ def _xfer_row(label, graph, width=13):
     if graph is None:
         return label + " " * (width + 1) + "—"
     hist = list(graph.hist)
-    n = min(width, len(hist))
+    n = min(2 * width, len(hist))
+    hist = hist[-n:]  # the newest n samples (the row reads newest first)
     dots = compute_dots(hist, total_dots=4)  # autoscale to its own window peak
     vals = [v for v in hist if v is not None]
     mx = max(vals) if vals else 0.0
-    cells = []
-    for col in range(n):
-        i = n - 1 - col  # leftmost character = newest sample
-        cells.append(BRAILLE[dots[i]][dots[i]])  # flat top: both dot columns at the same level
-    spark = "".join(cells).ljust(width)  # partial window grows from the left edge
+    if n % 2:
+        dots.append(0)
+    spark = "".join(dots_to_chars(dots[::-1], 1)[0]).ljust(width)  # partial window grows from the left
     return label + spark + " " + _rate_val(mx)
 
 
@@ -964,30 +965,62 @@ def compute_dots(samples, max=None, total_dots=4):
             for v in samples]
 
 
+def dots_to_chars(dots, rows):
+    """The braille characters for a `rows`-row plot from a dots array.
+
+    One sample per single dot line: a braille character is double-wide and
+    holds the dot lines of two adjacent samples - the newer sample in the
+    left dot column, the older in the right (so a character may be a
+    rising/falling glyph). An odd-length array is padded with a trailing
+    zero. Returns a rows x len//2 grid of 5x5 glyphs (indexed
+    [left level][right level]); grid row 0 is the top of the plot, so a
+    sample fills up from the last row. A sample with d dots occupies dots
+    [(rows-1-r)*4, (rows-r)*4) of row r's band."""
+    if len(dots) % 2:
+        dots = [*dots, 0]
+    grid = []
+    for r in range(rows):
+        band = (rows - 1 - r) * 4  # first dot of this row's band
+        line = []
+        for c in range(len(dots) // 2):
+            l = min(4, max(0, dots[2 * c] - band))
+            h = min(4, max(0, dots[2 * c + 1] - band))
+            line.append(BRAILLE[l][h])
+        grid.append(line)
+    return grid
+
+
 def draw_bar_graph(scr, y, graph: Graph, rows, width, key, c):
     hist_vals = list(graph.hist)
     dots = graph.dots(rows)  # one dot height per sample
-    plot_w = min(width - 14, len(hist_vals))  # one sample per braille char
+    # two samples per braille character: the plot is half the buffer wide;
+    # the buffer holds oldest -> newest, but the newest sample is on the
+    # left, so the window is read newest first
+    n = min(len(hist_vals), 2 * (width - 14))
+    vals = hist_vals[-n:][::-1]
+    grid = dots_to_chars(dots[-n:][::-1], rows)
+    plot_w = min(width - 14, (n + 1) // 2)
     peak_v = max((v for v in hist_vals if v is not None), default=0.0)
     base_attr = curses.color_pair(c.get(key, 0))
     # window-max samples are highlighted (bold peak color, or reverse video
-    # when the terminal has no colors)
+    # when the terminal has no colors); a glyph holds two dot lines, so a
+    # character is painted peak when either of its samples is the window max
     peak_attr = (curses.color_pair(c["peak"]) | curses.A_BOLD) if "peak" in c else curses.A_REVERSE
     # the newest sample is on the left: the leftmost character holds it and
-    # the graph scrolls left to right (bars enter left, exit right); a
-    # partial (not-yet-full) window grows from the left edge
+    # the second-newest sample, and the graph scrolls left to right (bars
+    # enter left, exit right); the newer sample always sits in the left dot
+    # line of its character, so each poll shifts every dot line by exactly
+    # half a character - the pairing never flips, it cannot jump; a partial
+    # (not-yet-full) window grows from the left edge
     for col in range(plot_w):
-        i = plot_w - 1 - col  # leftmost character = newest sample
-        v = hist_vals[i]
-        d = dots[i]
-        attr = peak_attr if (peak_v > 0 and v == peak_v) else base_attr
-        # a sample fills from the baseline up: text row y + r (r = 0 is the
-        # top of the plot) covers dot band [(rows-1-r)*4, (rows-r)*4)
+        pair = vals[2 * col:2 * col + 2]  # pair's samples, newer first
+        attr = (peak_attr if (peak_v > 0
+                              and any(v == peak_v for v in pair if v is not None))
+                else base_attr)
         for r in range(rows):
-            l = min(4, d - (rows - 1 - r) * 4)
-            if l <= 0:
+            ch = grid[r][col]
+            if ch == " ":
                 continue
-            ch = BRAILLE[l][l]  # flat top: both dot columns at the same level
             try:
                 scr.addstr(y + r, 1 + col, ch, attr)
             except curses.error:
@@ -1258,12 +1291,12 @@ def main_loop(stdscr, args):
 
     max_y, max_x = stdscr.getmaxyx()
     gwidth = max(20, max_x - 16)
-    # one sample per drawn character: histories are the column count
-    graphs = {"batch": Graph(gwidth, pinned=True),  # pinned: scale = plot's dot count (1 dot = 1 request)
-              "toks": Graph(gwidth), "prefill": Graph(gwidth),
-              # transfer sparklines: fixed 13-char width (13 samples ~ 6.5 s
+    # two samples per drawn character: histories are twice the column count
+    graphs = {"batch": Graph(2 * gwidth, pinned=True),  # pinned: scale = plot's dot count (1 dot = 1 request)
+              "toks": Graph(2 * gwidth), "prefill": Graph(2 * gwidth),
+              # transfer sparklines: fixed 13-char width (26 samples ~ 13 s
               # at the default 500 ms poll), independent of terminal width
-              "xfer_d2h": Graph(13), "xfer_h2d": Graph(13)}
+              "xfer_d2h": Graph(26), "xfer_h2d": Graph(26)}
     interval = args.interval / 1000.0
     eng = Engine(args.url, interval, args.pricing_rates, label=args.pricing_model)
     last_poll = 0.0
@@ -1271,9 +1304,10 @@ def main_loop(stdscr, args):
 
     while running:
         now = time.time()
-        # one sample per character: each poll appends exactly one character,
-        # so redrawing after every poll shifts the graph by exactly one
-        # character - there is no pair phase to flip, it cannot jump
+        # each poll appends exactly one sample (half a character); the newer
+        # sample always occupies the left dot line of its character, so a
+        # redraw after every poll shifts every dot line by exactly half a
+        # character - the pairing never flips, the motion cannot jump
         if now - last_poll >= interval:
             last_poll = now
             s = eng.poll()
@@ -1318,7 +1352,7 @@ def main():
     ap.add_argument("--url", required=True, help="metrics endpoint (required, e.g. http://host:port/metrics)")
     ap.add_argument("-i", "--interval", type=int, default=500,
                 help="poll interval in ms (default 500); each poll shifts the "
-                     "bar graphs by exactly one character")
+                     "bar graphs by half a character (one dot line)")
     ap.add_argument("--text", action="store_true", help="one-shot plain-text stats, no TUI")
     ap.add_argument("--re-calib", action="store_true",
                     help="drop the ~/.ninfer_btop.json calibration cache and "

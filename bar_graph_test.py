@@ -7,12 +7,13 @@ compute_dots and draw_bar_graph code from ninfer_btop.py, so what you
 see is exactly what the TUI renders.
 
 Expect:
-  * every bar fills UP from the baseline (never down from the top)
+  * every dot line fills UP from the baseline (never down from the top)
   * the staircase ascends left -> right (min on the left = newest, max on
-    the right = oldest); the rightmost column holds the window max, so it
+    the right = oldest); the rightmost pair holds the window max, so it
     is painted with the peak highlight
-  * every character is a flat column of dots (one sample per character,
-    both dot columns at the same level): four dot levels per text row
+  * each braille character holds two adjacent samples (the newer in the
+    left dot line) - one single dot line per sample - so the slope is
+    drawn with rising/falling glyphs: four dot levels per text row
 
 Run:   python3 bar_graph_test.py            (real terminal; any key quits)
        python3 bar_graph_test.py --text     (plain stdout preview, piped)
@@ -74,20 +75,13 @@ def run_curses():
 
 
 def run_text():
-    """Plain stdout preview using the same dot math as the curses path."""
+    """Plain stdout preview using the same character math as the curses
+    path."""
     rows = 12
     g = make_staircase(rows)
-    hist = list(g.hist)
-    plot_w = len(hist)
-    dots = g.dots(rows)
-    out = []
-    for r in range(rows):  # r = 0 is the top row, as in draw_bar_graph
-        line = []
-        for col in range(plot_w):
-            i = plot_w - 1 - col  # leftmost character = newest sample
-            l = min(4, dots[i] - (rows - 1 - r) * 4)
-            line.append(nb.BRAILLE[l][l] if l > 0 else " ")
-        out.append("".join(line))
+    plot_w = (len(list(g.hist)) + 1) // 2
+    grid = nb.dots_to_chars(g.dots(rows)[::-1], rows)  # newest sample on the left
+    out = ["".join(line) for line in grid]
     out.append("─" * plot_w)
     print("\n".join(out))
 
