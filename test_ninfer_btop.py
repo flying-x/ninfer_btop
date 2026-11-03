@@ -587,6 +587,61 @@ class TestXferSpillRecall(Base):
         self.assertEqual(nb._rate_val(12_400_000.0), "12.40MB/s")
 
 
+# --------------------- J. batch panel height follows max concurrency
+
+class TestBatchHeight(Base):
+    """J: the batch panel is ceil(max_concurrency/4) chars high (1 braille
+    character resolves 4 dot levels = 4 concurrent requests)."""
+
+    def _panel_height(self, floor, calib, max_y=40):
+        nb.CALIB = calib
+        scr = FakeScreen(max_y, 120)
+        eng = make_engine(True)
+        eng.last_frame = self._sample()
+        graphs = {"batch": nb.Graph(60, floor=floor),
+                  "toks": nb.Graph(60), "prefill": nb.Graph(60)}
+        nb.frame(scr, eng, graphs, False, {})
+        b = min(rows_with(scr, "Batch size"))
+        p = min(rows_with(scr, "Prefill t/s"))
+        # title row + N graph rows + baseline row, then the next panel title
+        return p - b - 2
+
+    def test_J1_height_table(self):
+        for floor, want in ((0, 6), (1, 1), (4, 1), (5, 2), (8, 2),
+                            (9, 3), (12, 3), (24, 6), (28, 6)):
+            got = self._panel_height(floor, None)
+            self.assertEqual(got, want, "floor=%s" % floor)
+
+    def test_J2_calibrated_header_same_rule(self):
+        self.assertEqual(self._panel_height(1, CALIB_OK), 1)
+        self.assertEqual(self._panel_height(8, CALIB_OK), 2)
+
+    def test_J3_floor_preserved_on_resize_rebuild(self):
+        g = nb.Graph(60, floor=8)
+        g.add(3.0)
+        g2 = nb.Graph(40, floor=g.floor, fixed=g.fixed)
+        g2.hist.extend(list(g.hist)[-40:])
+        self.assertEqual(g2.floor, 8.0)
+        self.assertEqual(list(g2.hist), list(g.hist)[-40:])
+
+    def test_J4_fixed_scale_never_stretches_to_window_max(self):
+        g = nb.Graph(10, floor=4, fixed=True)
+        for v in (1.0, 2.0, 8.0):  # a burst above max_concurrency
+            g.add(v)
+        self.assertEqual(g.max_for_scale(), 4.0)  # pinned: 1 dot = 1 request
+        # before the anchor is known (floor 0) it falls back to the window max
+        g0 = nb.Graph(10, floor=0.0, fixed=True)
+        g0.add(3.0)
+        self.assertEqual(g0.max_for_scale(), 3.0)
+        # plain graphs still autoscale as before
+        gp = nb.Graph(10)
+        gp.add(3.0)
+        self.assertEqual(gp.max_for_scale(), 3.0)
+        gp2 = nb.Graph(10, floor=4)
+        gp2.add(1.0)
+        self.assertEqual(gp2.max_for_scale(), 4.0)  # floor still floors autoscale
+
+
 # ------------------------------------- I. pricing loader + row selection
 
 class TestPricingLoader(Base):

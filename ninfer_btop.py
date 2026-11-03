@@ -3,6 +3,12 @@
 
 Polls the engine's Prometheus metrics endpoint and renders:
   * scrolling bar graph: batch size  (ninfer_requests_running)
+    (height follows the engine's max concurrency: one braille character
+    resolves 4 dot levels = 4 concurrent requests, so the panel is
+    ceil(max_concurrency/4) chars high. The scale is pinned to
+    max_concurrency - one dot level is always one request, the window max
+    never stretches it, and overload clips at the top; for ninfer's cap
+    of 8 the panel is 1 or 2 chars high)
   * scrolling bar graph: prefill t/s (rate of ninfer_prefill_tokens_total)
   * scrolling bar graph: decode t/s  (rate of ninfer_generation_tokens_total)
     (btop's braille glyphs: one sample per character - a flat column of
@@ -562,12 +568,18 @@ class Graph:
     """Scrolling bar history. The newest sample sits at the left edge: bars
     enter on the left and scroll out on the right. One sample per drawn
     character, so a redraw after each poll shifts the graph by exactly one
-    character - it can never jump."""
+    character - it can never jump.
 
-    def __init__(self, width, floor=0.0):
+    `fixed` graphs pin their scale to `floor` (e.g. the engine's
+    max_concurrency for the batch graph): each unit of value is always
+    exactly one dot level, the window max never stretches the scale, and
+    values above the anchor clip at the top of the plot."""
+
+    def __init__(self, width, floor=0.0, fixed=False):
         self.hist = deque(maxlen=width)
         self.scale = None  # None => autoscale to window max
         self.floor = floor  # autoscale never goes below this (e.g. max_concurrency)
+        self.fixed = fixed  # True: scale is pinned to floor, no autoscale
 
     def add(self, v):
         self.hist.append(None if v is None else max(0.0, float(v)))
@@ -582,6 +594,11 @@ class Graph:
     def max_for_scale(self):
         vals = self.values
         m = max(vals) if vals else 0.0
+        # pinned scale: the anchor is the whole scale - the window max never
+        # stretches it (overshoots clip at the top); before the anchor is
+        # known, fall back to the window max so early samples still render
+        if self.fixed and self.floor > 0:
+            return self.floor
         if self.scale is not None:
             return max(m, self.scale)
         return max(m, self.floor)
@@ -967,14 +984,26 @@ def frame(scr, eng, graphs, paused, c):
     # title + 4 shared rows (incl. the spill/recall bars) + 1 footer; the
     # cur/min/max/avg figures sit in the panel titles, plots take the rest
     fixed = 18 if CALIB is not None else 17
-    plot_rows = max(1, min(6, (max_y - fixed) // 3))
+    # the batch panel's height follows the engine's max concurrency (kept in
+    # Graph.floor, updated on every poll): one braille character resolves 4
+    # dot levels, so N concurrent requests need ceil(N/4) characters
+    # (<=4 -> 1 char, 5-8 -> 2, 9-12 -> 3, ...), which makes each dot level
+    # exactly one request. ninfer caps concurrency at 8, so its batch graph
+    # is 1 or 2 chars high. Before the first max-concurrency sample the
+    # panel falls back to the even three-way split of the remaining rows.
+    if g_batch.floor > 0:
+        rows_batch = max(1, min(6, -(-int(g_batch.floor) // 4)))
+    else:
+        rows_batch = max(1, min(6, (max_y - fixed) // 3))
+    # prefill/decode share the rows the batch panel does not use
+    plot_rows = max(1, min(6, (max_y - fixed - rows_batch) // 2))
 
     # --- batch panel
     b = (s or {}).get("running")
     cur_b = f"{b:.0f}" if b is not None else "—"
     y = draw_panel(scr, y, "Batch size  (ninfer_requests_running)", "batch", c, width,
                    metric_stat_segments(g_batch, cur_b))
-    y = draw_bar_graph(scr, y, g_batch, plot_rows, width, "batch", c)
+    y = draw_bar_graph(scr, y, g_batch, rows_batch, width, "batch", c)
     if s:
         # paused is the one lane number that signals a problem: a live
         # request stalled on a capacity event, so paint it red when non-zero
@@ -1123,7 +1152,8 @@ def main_loop(stdscr, args):
     max_y, max_x = stdscr.getmaxyx()
     gwidth = max(20, max_x - 16)
     # one sample per drawn character: histories are the column count
-    graphs = {"batch": Graph(gwidth), "toks": Graph(gwidth), "prefill": Graph(gwidth),
+    graphs = {"batch": Graph(gwidth, fixed=True),  # pinned: 1 dot level = 1 request
+              "toks": Graph(gwidth), "prefill": Graph(gwidth),
               # transfer sparklines: fixed 13-char width (13 samples ~ 6.5 s
               # at the default 500 ms poll), independent of terminal width
               "xfer_d2h": Graph(13), "xfer_h2d": Graph(13)}
@@ -1161,8 +1191,9 @@ def main_loop(stdscr, args):
             gwidth = max(20, nx - 16)
             for k in ("batch", "toks", "prefill"):  # xfer sparklines stay 13 chars
                 old = list(graphs[k].hist)
-                graphs[k] = Graph(gwidth)
-                graphs[k].hist.extend(old[-gwidth:])
+                g2 = Graph(gwidth, floor=graphs[k].floor, fixed=graphs[k].fixed)
+                g2.hist.extend(old[-gwidth:])
+                graphs[k] = g2
             frame(stdscr, eng, graphs, paused, c)
 
         ch = stdscr.getch()

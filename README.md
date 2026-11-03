@@ -6,7 +6,12 @@ A btop-style live dashboard for a [NInfer](https://github.com/Neroued/ninfer) in
 
 Polls the engine's Prometheus `/metrics` endpoint and renders:
 
-- scrolling bar graph: **batch size** (`ninfer_requests_running`)
+- scrolling bar graph: **batch size** (`ninfer_requests_running`). The panel's height follows
+  the engine's max concurrency: one braille character resolves 4 dot levels (4 concurrent
+  requests), so the graph is ceil(max_concurrency / 4) characters high. Its scale is pinned
+  to max_concurrency — one dot level is always exactly one request, the window max never
+  stretches the scale, and overload clips at the top — at ninfer's cap of 8 the panel is
+  1 or 2 characters high.
 - scrolling bar graph: **prefill t/s** (inter-poll rate of `ninfer_prefill_tokens_total` —
   prompt processing). While a request is prefilling, decode t/s is correctly 0 and the prefill
   graph shows the work; both rates drop to 0 as soon as the engine is idle.
