@@ -45,10 +45,10 @@ Polls the engine's Prometheus `/metrics` endpoint and renders:
   INT8 group-64 KV (fp16 scale per 64-element group), 33,024 for FP8 e4m3
   group-128) and "Req hit" (request-level hit:
   `ninfer_checkpoint_selections_total` ÷ checkpoint+root selections) ratios,
-  plus two braille sparklines for context transfers: "Spill (d2h)" (device→host) and
+  plus two one-row braille graphs for context transfers: "Spill (d2h)" (device→host) and
   "Recall (h2d)" (host→device), read per-direction from
   `ninfer_context_transfer_bytes_total` (`direction="d2h"` / `"h2d"`). Each
-  sparkline keeps ~6.5 s of history, autoscales to its own window peak
+  graph keeps ~13 s of history, autoscales to its own window peak
   (shown as the side label for scale), and uses the same braille dots and double-wide characters as the
   main graphs — so a few-millisecond recall burst that a one-poll bar would
   miss stays visible for the whole window, and host-tier shedding vs re-use

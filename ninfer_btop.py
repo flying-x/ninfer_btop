@@ -889,7 +889,7 @@ def draw_triple_panel(scr, y, left_title, mid_title, right_title, c, width):
 
 
 def _xfer_row(label, graph, width=13):
-    """One cache-panel transfer row: a one-row braille sparkline over the
+    """One cache-panel transfer row: a one-row braille graph over the
     graph's window (the same dots and double-wide characters as the main
     bar graphs - each character holds two adjacent samples, the newer in
     the left dot line), autoscaled to its own window peak, with that peak
@@ -909,8 +909,8 @@ def _xfer_row(label, graph, width=13):
     mx = max(vals) if vals else 0.0
     if n % 2:
         dots.append(0)
-    spark = "".join(dots_to_chars(dots[::-1], 1)[0]).ljust(width)  # partial window grows from the left
-    return label + spark + " " + _rate_val(mx)
+    chars = "".join(dots_to_chars(dots[::-1], 1)[0]).ljust(width)  # partial window grows from the left
+    return label + chars + " " + _rate_val(mx)
 
 
 def _rate_val(rate):
@@ -997,15 +997,9 @@ def draw_bar_graph(scr, y, graph: Graph, rows, width, key, c):
     # the buffer holds oldest -> newest, but the newest sample is on the
     # left, so the window is read newest first
     n = min(len(hist_vals), 2 * (width - 14))
-    vals = hist_vals[-n:][::-1]
     grid = dots_to_chars(dots[-n:][::-1], rows)
     plot_w = min(width - 14, (n + 1) // 2)
-    peak_v = max((v for v in hist_vals if v is not None), default=0.0)
     base_attr = curses.color_pair(c.get(key, 0))
-    # window-max samples are highlighted (bold peak color, or reverse video
-    # when the terminal has no colors); a glyph holds two dot lines, so a
-    # character is painted peak when either of its samples is the window max
-    peak_attr = (curses.color_pair(c["peak"]) | curses.A_BOLD) if "peak" in c else curses.A_REVERSE
     # the newest sample is on the left: the leftmost character holds it and
     # the second-newest sample, and the graph scrolls left to right (bars
     # enter left, exit right); the newer sample always sits in the left dot
@@ -1013,16 +1007,12 @@ def draw_bar_graph(scr, y, graph: Graph, rows, width, key, c):
     # half a character - the pairing never flips, it cannot jump; a partial
     # (not-yet-full) window grows from the left edge
     for col in range(plot_w):
-        pair = vals[2 * col:2 * col + 2]  # pair's samples, newer first
-        attr = (peak_attr if (peak_v > 0
-                              and any(v == peak_v for v in pair if v is not None))
-                else base_attr)
         for r in range(rows):
             ch = grid[r][col]
             if ch == " ":
                 continue
             try:
-                scr.addstr(y + r, 1 + col, ch, attr)
+                scr.addstr(y + r, 1 + col, ch, base_attr)
             except curses.error:
                 pass
     # baseline
@@ -1294,7 +1284,7 @@ def main_loop(stdscr, args):
     # two samples per drawn character: histories are twice the column count
     graphs = {"batch": Graph(2 * gwidth, pinned=True),  # pinned: scale = plot's dot count (1 dot = 1 request)
               "toks": Graph(2 * gwidth), "prefill": Graph(2 * gwidth),
-              # transfer sparklines: fixed 13-char width (26 samples ~ 13 s
+              # transfer graphs: fixed 13-char width (26 samples ~ 13 s
               # at the default 500 ms poll), independent of terminal width
               "xfer_d2h": Graph(26), "xfer_h2d": Graph(26)}
     interval = args.interval / 1000.0
@@ -1329,7 +1319,7 @@ def main_loop(stdscr, args):
         ny, nx = stdscr.getmaxyx()
         if abs(nx - 16 - gwidth) > 2:
             gwidth = max(20, nx - 16)
-            for k in ("batch", "toks", "prefill"):  # xfer sparklines stay 13 chars
+            for k in ("batch", "toks", "prefill"):  # xfer graphs stay 13 chars
                 old = list(graphs[k].hist)
                 g2 = Graph(gwidth, floor=graphs[k].floor, pinned=graphs[k].pinned)
                 g2.hist.extend(old[-gwidth:])

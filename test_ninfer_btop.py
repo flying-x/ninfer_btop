@@ -339,6 +339,19 @@ class TestMetricStatBanner(Base):
         # the max token is never drawn in a plain (non-peak) attribute
         self.assertFalse(any(w[2].startswith(",max=") and w[3] != peak_attr for w in row))
 
+    def test_F4_graphs_paint_no_peak_highlight(self):
+        g = nb.Graph(10)
+        for v in (2, 8, 4, 6, 0):
+            g.add(v)
+        # the bar graph itself has no peak highlight: every glyph - the
+        # window max included - is painted with the panel's base color
+        # (0 under the colorless stub; a highlighted char would be A_REVERSE)
+        scr = FakeScreen(40, 120)
+        nb.draw_bar_graph(scr, 0, g, 2, 50, "toks", {})
+        glyphs = [w for w in scr.writes if not w[2].startswith("─")]
+        self.assertTrue(glyphs)
+        self.assertTrue(all(w[3] == 0 for w in glyphs))
+
 
 
 class TestCacheHealth(Base):
@@ -582,7 +595,7 @@ class TestXferSpillRecall(Base):
         finally:
             nb.time.monotonic = real_mono
 
-    def test_H3_frame_renders_spill_recall_sparklines(self):
+    def test_H3_frame_renders_spill_recall_xfer_graphs(self):
         nb.curses.color_pair = lambda i: 1 + i
         c = {"ok": 1, "bad": 2, "toks": 3, "dim": 4, "kv": 5, "title": 6,
              "batch": 7, "label": 8, "val": 9, "peak": 10}
@@ -606,7 +619,7 @@ class TestXferSpillRecall(Base):
         self.assertTrue(rows_with(scr, "Recall"))
         spill = next(t for (_, _, t, _) in scr.writes if "Spill" in t)
         recall = next(t for (_, _, t, _) in scr.writes if "Recall" in t)
-        # each sparkline autoscales to its OWN window peak: a 200 B/s spill
+        # each xfer graph autoscales to its OWN window peak: a 200 B/s spill
         # burst and a 30 B/s recall burst both reach the full braille dot,
         # and the side label is that window peak (the scale of the dots)
         self.assertIn("⣿", spill)
@@ -616,8 +629,8 @@ class TestXferSpillRecall(Base):
         # the row must fit the ⅓-width cache column at 120 cols (38 chars)
         self.assertLessEqual(len(spill), 38)
 
-    def test_H4_sparkline_autoscale_and_empty(self):
-        # all-zero window: blank sparkline, 0B/s label
+    def test_H4_xfer_graph_autoscale_and_empty(self):
+        # all-zero window: blank graph, 0B/s label
         g = nb.Graph(26)
         for _ in range(26):
             g.add(0.0)

@@ -9,8 +9,8 @@ see is exactly what the TUI renders.
 Expect:
   * every dot line fills UP from the baseline (never down from the top)
   * the staircase ascends left -> right (min on the left = newest, max on
-    the right = oldest); the rightmost pair holds the window max, so it
-    is painted with the peak highlight
+    the right = oldest); every character is painted in the panel's base
+    color - the graph has no peak highlight
   * each braille character holds two adjacent samples (the newer in the
     left dot line) - one single dot line per sample - so the slope is
     drawn with rising/falling glyphs: four dot levels per text row
