@@ -16,6 +16,7 @@ import textwrap
 import time
 import unittest
 
+import frame_chrome as fc
 import ninfer_btop as nb
 
 
@@ -234,7 +235,7 @@ class TestFrameDownState(Base):
         nb.CALIB = calib
         scr = FakeScreen(40, 120)
         graphs = {k: nb.Graph(60) for k in ("batch", "toks", "prefill")}
-        nb.frame(scr, make_engine(ok), graphs, {})
+        fc.frame(scr, make_engine(ok), graphs, {}, calib)
         return scr
 
     def test_D1_down_calibrated_banner_and_panels_disjoint(self):
@@ -272,11 +273,11 @@ class TestFrameDownState(Base):
 class TestPureFunctions(Base):
     def test_E1_draw_panel_keeps_the_last_title_char(self):
         scr = FakeScreen(40, 120)
-        nb.draw_panel(scr, 0, "Token totals", "title", {}, width=40)
+        fc.draw_panel(scr, 0, "Token totals", "title", {}, width=40)
         row = [t for (y, x, t, a) in scr.writes if y == 0][0]
         self.assertTrue(row.startswith("─Token totals"), row)
         scr2 = FakeScreen(40, 120)
-        nb.draw_panel(scr2, 0, "ABCDEFGHIJKLMNOP", "title", {}, width=18)
+        fc.draw_panel(scr2, 0, "ABCDEFGHIJKLMNOP", "title", {}, width=18)
         row2 = [t for (y, x, t, a) in scr2.writes if y == 0][0]
         self.assertEqual(row2, "─ABCDEFGHIJKLMNOP")
 
@@ -312,7 +313,7 @@ class TestMetricStatBanner(Base):
         g = nb.Graph(10)
         for v in (2, 8, 4, 6, 0):
             g.add(v)
-        segs = nb.metric_stat_segments(g, "4")
+        segs = fc.metric_stat_segments(g, "4")
         self.assertEqual("".join(t for t, _ in segs),
                            "(cur=4,max=8,peak=8,avg=4,min=0)")
         flags = [flag for _, flag in segs]
@@ -320,15 +321,15 @@ class TestMetricStatBanner(Base):
         self.assertTrue(next(t for t, flag in segs if flag).startswith(",max="))
 
     def test_F2_empty_window_has_no_banner_suffix(self):
-        self.assertEqual(nb.metric_stat_segments(nb.Graph(10), "—"), [])
+        self.assertEqual(fc.metric_stat_segments(nb.Graph(10), "—"), [])
 
     def test_F3_draw_panel_paints_max_in_peak_color(self):
         g = nb.Graph(10)
         for v in (2, 8, 4):
             g.add(v)
         scr = FakeScreen(40, 120)
-        nb.draw_panel(scr, 0, "Batch size  (ninfer_requests_running)", "batch", {}, 120,
-                      stats=nb.metric_stat_segments(g, "4"))
+        fc.draw_panel(scr, 0, "Batch size  (ninfer_requests_running)", "batch", {}, 120,
+                      stats=fc.metric_stat_segments(g, "4"))
         row = [w for w in scr.writes if w[0] == 0]
         joined = "".join(w[2] for w in row)
         for token in ("cur=4", "max=8", "peak=8", "avg=", "min="):
@@ -351,7 +352,7 @@ class TestMetricStatBanner(Base):
         # window max included - is painted with the panel's base color
         # (0 under the colorless stub; a highlighted char would be A_REVERSE)
         scr = FakeScreen(40, 120)
-        nb.draw_bar_graph(scr, 0, g, 2, 50, "toks", {})
+        fc.draw_bar_graph(scr, 0, g, 2, 50, "toks", {})
         # the moving bars (x <= width-STAT_COLS) are painted in the base
         # color; the MhHDWL summary columns on the right are dimmed
         glyphs = [w for w in scr.writes
@@ -400,7 +401,7 @@ class TestCacheHealth(Base):
         eng.start_time = None
         graphs = {k: nb.Graph(60) for k in ("batch", "toks", "prefill")}
         scr = FakeScreen(40, 120)
-        nb.frame(scr, eng, graphs, c)
+        fc.frame(scr, eng, graphs, c)
         self.assertTrue(rows_with(scr, "Device KV"))
         self.assertTrue(rows_with(scr, "Host KV"))
         self.assertTrue(rows_with(scr, "Cache (checkpoint reuse)"))
@@ -447,7 +448,7 @@ class TestCacheHealth(Base):
         eng.last_frame = s
         graphs = {k: nb.Graph(60) for k in ("batch", "toks", "prefill")}
         scr = FakeScreen(40, 120)
-        nb.frame(scr, eng, graphs, c)
+        fc.frame(scr, eng, graphs, c)
         joined = "".join(t for (_, _, t, _) in scr.writes)
         # the line must fit the 38-char column at 120 cols: no space between
         # the two groups, both labels fully visible
@@ -470,7 +471,7 @@ class TestCacheHealth(Base):
         eng.last_frame = self._sample()
         graphs = {k: nb.Graph(60) for k in ("batch", "toks", "prefill")}
         scr = FakeScreen(40, 120)
-        nb.frame(scr, eng, graphs, c)
+        fc.frame(scr, eng, graphs, c)
         self.assertFalse(rows_with(scr, "(device)"))
         self.assertTrue(rows_with(scr, "Tok hit"))
 
@@ -484,14 +485,14 @@ class TestCacheHealth(Base):
         # paused = 2 -> the "paused 2" segment carries the 'bad' (red) pair
         eng.last_frame = self._sample(paused=2)
         scr = FakeScreen(40, 120)
-        nb.frame(scr, eng, graphs, c)
+        fc.frame(scr, eng, graphs, c)
         bad_attr = 1 + c["bad"]
         self.assertTrue(any("paused 2" in t and a == bad_attr
                             for (_, _, t, a) in scr.writes))
         # paused = 0 -> the same segment is painted with the default color
         eng.last_frame = self._sample(paused=0)
         scr = FakeScreen(40, 120)
-        nb.frame(scr, eng, graphs, c)
+        fc.frame(scr, eng, graphs, c)
         self.assertTrue(any("paused 0" in t and a == 0
                             for (_, _, t, a) in scr.writes))
 
@@ -507,7 +508,7 @@ class TestCacheHealth(Base):
         eng.start_time = None
         graphs = {k: nb.Graph(60) for k in ("batch", "toks", "prefill")}
         scr = FakeScreen(40, 120)
-        nb.frame(scr, eng, graphs, c)
+        fc.frame(scr, eng, graphs, c, nb.CALIB)
         row1 = "".join(t for (y, x, t, a) in scr.writes if y == 1)
         self.assertIn("calibrated in", row1)
         self.assertIn("ctx 128.0 KiToks", row1)
@@ -523,7 +524,7 @@ class TestCacheHealth(Base):
         eng.start_time = None
         graphs = {k: nb.Graph(60) for k in ("batch", "toks", "prefill")}
         scr = FakeScreen(40, 120)
-        nb.frame(scr, eng, graphs, c)
+        fc.frame(scr, eng, graphs, c, nb.CALIB)
         row1 = "".join(t for (y, x, t, a) in scr.writes if y == 1)
         self.assertIn("calibrated in", row1)
         self.assertNotIn("KiToks", row1)
@@ -536,7 +537,7 @@ class TestCacheHealth(Base):
         eng.start_time = None
         graphs = {k: nb.Graph(60) for k in ("batch", "toks", "prefill")}
         scr = FakeScreen(40, 120)
-        nb.frame(scr, eng, graphs, {})
+        fc.frame(scr, eng, graphs, {})
         row1 = "".join(t for (y, x, t, a) in scr.writes if y == 1)
         self.assertIn("128.0 KiToks", row1)
 
@@ -621,7 +622,7 @@ class TestXferSpillRecall(Base):
         graphs["xfer_d2h"] = d2h
         graphs["xfer_h2d"] = h2d
         scr = FakeScreen(40, 120)
-        nb.frame(scr, eng, graphs, c)
+        fc.frame(scr, eng, graphs, c)
         self.assertTrue(rows_with(scr, "Spill"))
         self.assertTrue(rows_with(scr, "Recall"))
         spill = next(t for (_, _, t, _) in scr.writes if "Spill" in t)
@@ -670,7 +671,7 @@ class TestBatchHeight(Base):
         eng.last_frame = self._sample()
         graphs = {"batch": nb.Graph(60, floor=floor),
                   "toks": nb.Graph(60), "prefill": nb.Graph(60)}
-        nb.frame(scr, eng, graphs, {})
+        fc.frame(scr, eng, graphs, {}, calib)
         b = min(rows_with(scr, "Batch size"))
         p = min(rows_with(scr, "Prefill t/s"))
         # title row + N graph rows + baseline row, then the next panel title
@@ -777,7 +778,7 @@ class TestPeriodColumns(Base):
         for _ in range(30):
             g.add(5.0)
         scr = FakeScreen(40, 32)
-        nb.draw_bar_graph(scr, 0, g, 1, 30, "toks", {})
+        fc.draw_bar_graph(scr, 0, g, 1, 30, "toks", {})
         # the MhHDWL labels sit on the baseline row under the summary columns
         lab = [w for w in scr.writes if w[2] == "MhHDWL"]
         self.assertEqual(lab[0][:3], (1, 25, "MhHDWL"))
@@ -833,7 +834,7 @@ class TestPeriodColumns(Base):
         for _ in range(30):
             g.add(1.0)
         scr = FakeScreen(40, 32)
-        nb.draw_bar_graph(scr, 0, g, 1, 30, "toks", {})
+        fc.draw_bar_graph(scr, 0, g, 1, 30, "toks", {})
         # width-STAT_COLS = 24 chars = 48 samples * 0.5 s = "24 seconds"
         span = "24 seconds"
         lab = [w for w in scr.writes if w[2] == span]
