@@ -17,9 +17,10 @@ Polls the engine's Prometheus metrics endpoint and renders:
     per text line; the graphs scroll left to right: the newest sample
     enters at the left edge, and each poll shifts every dot line by
     exactly half a character, so the motion can never jump)
-    - the rightmost 5 braille columns of each graph are period summaries,
-      labeled MhHDL on the baseline row: M last minute, h last half-hour,
-      H last hour, D last day, L this monitor process's life-time. Each
+    - the rightmost 6 braille columns of each graph are period summaries,
+      labeled MhHDWL on the baseline row: M last 5 minutes, h last
+      half-hour, H last hour, D last day, W last week, L this monitor
+      process's life-time. Each
       column's left dot line is the period average, its right dot line the
       period max, in the graph's own dot scale (a period max above the
       current display scale clips at the top)
@@ -681,9 +682,12 @@ class Engine:
             return None
 
 
-# seconds per day: the raw sample buffer keeps one day, and the D
-# summary window spans the whole kept buffer
+# seconds per day: the D window, and the building block of the week
+# buffer span
 DAY_SECS = 86400
+# one week: the raw sample buffer keeps one week, and the W summary
+# window spans the whole kept buffer
+WEEK_SECS = 7 * DAY_SECS
 
 
 class Graph:
@@ -700,27 +704,28 @@ class Graph:
     clips at the top. `floor` is the engine's max_concurrency, which
     sizes the panel height.
 
-    `samples` is the raw history, trimmed to the last day (blanks as
-    0.0). The M/h/H/D summary figures are recomputed from that buffer
+    `samples` is the raw history, trimmed to the last week (blanks as
+    0.0). The M/h/H/D/W summary figures are recomputed from that buffer
+    (the week window spans the whole kept buffer)
     on every poll (a few milliseconds per graph - the buffer holds at
-    most a day of samples, so the displayed figures are exact functions
+    most a week of samples, so the displayed figures are exact functions
     of the stored samples and cannot drift), and the L column is a
     separate running total and max over the whole process life. Memory
-    stays bounded (about 0.7 MB per graph at the default 0.5 s poll) no
+    stays bounded (about 5 MB per graph at the default 0.5 s poll) no
     matter how long the process runs. The figures cover this monitor
     run, not the engine's life."""
 
-    # M 1 min, h 30 min, H 1 h, D 1 day (== the kept raw history)
-    _PERIOD_SECS = (60, 1800, 3600, DAY_SECS)
+    # M 5 min, h 30 min, H 1 h, D 1 day, W 1 week (== the kept raw history)
+    _PERIOD_SECS = (300, 1800, 3600, DAY_SECS, WEEK_SECS)
 
     def __init__(self, width, floor=0.0, pinned=False, interval=0.5):
         self.interval = interval if interval and interval > 0 else 0.5
         self.hist = deque(maxlen=width)
-        self.samples = array.array("f")  # raw history, trimmed to the last day
-        self.day_cap = int(DAY_SECS / self.interval)  # one day of samples
+        self.samples = array.array("f")  # raw history, trimmed to the last week
+        self.hist_cap = int(WEEK_SECS / self.interval)  # one week of samples
         self.window_ns = tuple(
             max(1, int(secs / self.interval)) for secs in self._PERIOD_SECS
-        )  # M/h/H/D window sizes in samples (D == the kept history)
+        )  # M/h/H/D/W window sizes in samples (W == the kept history)
         self.life_sum = 0.0   # whole-process running total (L column)
         self.life_count = 0
         self.life_max = 0.0   # whole-process max (never shrinks: scalar)
@@ -729,15 +734,15 @@ class Graph:
 
     def _record(self, v):
         """Fold one sample (blanks as 0.0) into the raw history and the
-        whole-process L aggregates. The M/h/H/D figures are recomputed
+        whole-process L aggregates. The M/h/H/D/W figures are recomputed
         from the raw history in period_stats, so nothing else to fold."""
         self.samples.append(v)
         self.life_sum += v
         self.life_count += 1
         if v > self.life_max:
             self.life_max = v
-        if len(self.samples) > self.day_cap:
-            del self.samples[:len(self.samples) - self.day_cap]
+        if len(self.samples) > self.hist_cap:
+            del self.samples[:len(self.samples) - self.hist_cap]
 
     def adopt_history(self, old):
         """Take over another graph's raw history and L aggregates
@@ -848,7 +853,7 @@ def make_colors(scr):
     curses.start_color()
     curses.use_default_colors()
     c = {}
-    # 256-palette entries for the MhHDL summary columns (terminals that
+    # 256-palette entries for the MhHDWL summary columns (terminals that
     # drop SGR-2 dim): 22 = #005f00, 100 = #878700
     DARK_GREEN, DARK_OLIVE = 22, 100
     pairs = {
@@ -1083,9 +1088,10 @@ def dots_to_chars(dots, rows):
 
 
 def period_stats(graph):
-    """(average, max) for the M/h/H/D/L summary columns. M/h/H/D are
-    recomputed over the one-day raw history on every poll (a few ms per
-    graph) so the figures are exact functions of the stored samples; L
+    """(average, max) for the M/h/H/D/W/L summary columns. M/h/H/D/W are
+    recomputed over the one-week raw history on every poll (a few ms per
+    graph; the week window spans the whole kept buffer) so the figures are
+    exact functions of the stored samples; L
     is the running total and max over the whole process life. The
     figures cover this monitor run, not the engine's life."""
     if not len(graph.samples):
@@ -1099,10 +1105,15 @@ def period_stats(graph):
 
 
 # rightmost columns of each bar graph: one period summary per label
-# character (avg/max over the last minute / half-hour / hour / day /
-# process life); period_stats emits exactly len(STAT_LABEL) figures
-STAT_LABEL = "MhHDL"
+# character (avg/max over the last 5 min / half-hour / hour / day /
+# week / process life); period_stats emits exactly len(STAT_LABEL)
+# figures
+STAT_LABEL = "MhHDWL"
 STAT_COLS = len(STAT_LABEL)
+
+# ESC: classic value 27; some curses builds (e.g. the box's system
+# python3.14) omit the KEY_ESCAPE constant entirely
+KEY_ESCAPE = getattr(curses, "KEY_ESCAPE", 27)
 
 
 def draw_bar_graph(scr, y, graph: Graph, rows, width, key, c):
@@ -1111,7 +1122,7 @@ def draw_bar_graph(scr, y, graph: Graph, rows, width, key, c):
     # two samples per braille character: the plot is half the buffer wide;
     # the buffer holds oldest -> newest, but the newest sample is on the
     # left, so the window is read newest first
-    # the rightmost STAT_COLS columns are reserved for the MhHDL summaries
+    # the rightmost STAT_COLS columns are reserved for the MhHDWL summaries
     n = min(len(hist_vals), 2 * (width - STAT_COLS))
     grid = dots_to_chars(dots[-n:][::-1], rows)
     plot_w = min(width - STAT_COLS, (n + 1) // 2)
@@ -1131,7 +1142,7 @@ def draw_bar_graph(scr, y, graph: Graph, rows, width, key, c):
                 scr.addstr(y + r, 1 + col, ch, base_attr)
             except curses.error:
                 pass
-    # rightmost 5 columns: M/h/H/D/L summaries (left dot line = avg, right
+    # rightmost STAT_COLS columns: M/h/H/D/W/L summaries (left dot line = avg, right
     # = max), grayed out against the moving bars (darker color pair on
     # 256-color terminals, A_DIM fallback otherwise), in the plot's dot
     # scale
@@ -1447,7 +1458,7 @@ def main_loop(stdscr, args):
     interval = args.interval / 1000.0
     # two samples per drawn character: the buffer holds exactly what the
     # scroll region draws (width-STAT_COLS chars = 2*(width-STAT_COLS)
-    # samples) - the rightmost STAT_COLS columns are the MhHDL summaries,
+    # samples) - the rightmost STAT_COLS columns are the MhHDWL summaries,
     # so a wider buffer would
     # hide scroll data under them and the banner max/avg/min (computed over
     # the buffer) would lag the visible plot
@@ -1502,7 +1513,7 @@ def main_loop(stdscr, args):
             # small sleep so we don't spin when no key
             time.sleep(0.05)
             continue
-        if ch in (ord("q"), ord("Q"), curses.KEY_ESCAPE):
+        if ch in (ord("q"), ord("Q"), KEY_ESCAPE):
             running = False
 
     return 0

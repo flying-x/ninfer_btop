@@ -59,34 +59,35 @@ Resolves dot heights into braille characters, the way btop does:
   plain `peak=` token and is what scales the graph.
  - The baseline row under the plot is labeled in its middle with the time
    span the plot region covers: two samples per character, so the span is
-   `2 * (width - STAT_COLS) * interval` seconds ("114 seconds" at the
+   `2 * (width - STAT_COLS) * interval` seconds ("113 seconds" at the
    default 119-column width and 0.5 s poll).
 
-## Period summary columns (MhHDL)
+## Period summary columns (MhHDWL)
 
-The rightmost 5 braille columns of each scrolling graph are reserved for
-period summaries, labeled `MhHDL` on the baseline row where the dashes
+The rightmost 6 braille columns of each scrolling graph are reserved for
+period summaries, labeled `MhHDWL` on the baseline row where the dashes
 would run (the dashes fill the scrolling area only):
 
-- **M** last minute, **h** last half-hour, **H** last hour, **D** last
-  day, **L** this monitor process's life-time. The windows are counted in
-  poll intervals (e.g. at the default 0.5 s poll: M = 120 samples); a
-  period longer than the process life clamps to all available samples.
+- **M** last 5 minutes, **h** last half-hour, **H** last hour, **D** last
+  day, **W** last week, **L** this monitor process's life-time. The
+  windows are counted in poll intervals (e.g. at the default 0.5 s poll:
+  M = 300 samples); a period longer than the process life clamps to all
+  available samples; W spans the kept one-week buffer.
   The figures cover **this monitor run**, not the engine's life.
 - Each column is one double-wide braille character: the **left dot line
-  is the period average, the right dot line the period max**. The M/h/H/D
-  figures are recomputed from the one-day raw history buffer (trimmed to
-  the last day) on every poll - a few milliseconds per graph - so the
+  is the period average, the right dot line the period max**. The M/h/H/D/W
+  figures are recomputed from the one-week raw history buffer (trimmed to
+  the last week; W spans the whole kept buffer) on every poll - a few milliseconds per graph - so the
   displayed figures are exact functions of the stored samples and cannot
   drift from accumulated float error. L is a separate running total and
   max over the whole process life (plain scalars - its window never
-  shrinks). Memory is bounded (about 0.7 MB per graph at the default
+  shrinks). Memory is bounded (about 5 MB per graph at the default
   0.5 s poll), no matter how long the process runs. Blanks count as 0,
   like the scrolling plot.
 - The summaries are drawn in the graph's own dot scale
   (`Graph.dot_scale` — the plot height for the batch graph, the lifetime
   peak for the rest), so they read against the plot next to them.
-- They are grayed out against the moving bars, including the `MhHDL`
+- They are grayed out against the moving bars, including the `MhHDWL`
   labels on the baseline row: darker color pairs on 256-color terminals
   (dark green / dark yellow), an `A_DIM` attribute on terminals without
   those pairs.
@@ -138,6 +139,6 @@ Reusable rules distilled from this implementation:
 
 - `test_ninfer_btop.py` covers the unit behavior (J tests for
   `compute_dots`/`dots_to_chars`, H tests for the frame integration,
-  I tests for the MhHDL period summary columns).
+  I tests for the MhHDWL period summary columns).
 - `bar_graph_test.py` is a visual tester: run it against a live endpoint
   (or with `--text`) to watch the scroll motion and glyph texture.

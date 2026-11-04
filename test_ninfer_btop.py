@@ -351,10 +351,10 @@ class TestMetricStatBanner(Base):
         # (0 under the colorless stub; a highlighted char would be A_REVERSE)
         scr = FakeScreen(40, 120)
         nb.draw_bar_graph(scr, 0, g, 2, 50, "toks", {})
-        # the moving bars (x <= width-5) are painted in the base color; the
-        # MhHDL summary columns on the right are intentionally dimmed
+        # the moving bars (x <= width-STAT_COLS) are painted in the base
+        # color; the MhHDWL summary columns on the right are dimmed
         glyphs = [w for w in scr.writes
-                  if w[1] <= 45 and not w[2].startswith("─")]
+                  if w[1] <= 44 and not w[2].startswith("─")]
         self.assertTrue(glyphs)
         self.assertTrue(all(w[3] == 0 for w in glyphs))
 
@@ -744,18 +744,19 @@ class TestPeriodColumns(Base):
     """I: M/h/H/D/L period summary columns (avg left, max right)."""
 
     def test_I1_period_stats_windows(self):
-        # 2 min of 0.5 s samples: first minute 2.0, second minute 10.0
+        # 10 min of 0.5 s samples: first 5 min 2.0, second 5 min 10.0 -
+        # the M (5 min) window sees exactly the second half; h/H/D/W/L all
+        # clamp to the whole 10-minute buffer
         g = nb.Graph(50)
-        for _ in range(120):
+        for _ in range(600):
             g.add(2.0)
-        for _ in range(120):
+        for _ in range(600):
             g.add(10.0)
         stats = nb.period_stats(g)
-        self.assertEqual(len(stats), 5)
+        self.assertEqual(len(stats), 6)
         m_avg, m_max = stats[0]
         self.assertAlmostEqual(m_avg, 10.0)
         self.assertAlmostEqual(m_max, 10.0)
-        # h/H/D/L all clamp to the whole 2-minute buffer
         for avg, mx in stats[1:]:
             self.assertAlmostEqual(avg, 6.0)
             self.assertAlmostEqual(mx, 10.0)
@@ -765,7 +766,7 @@ class TestPeriodColumns(Base):
         for _ in range(10):
             g.add(4.0)
         stats = nb.period_stats(g)
-        self.assertEqual(len(stats), 5)
+        self.assertEqual(len(stats), 6)
         for avg, mx in stats:
             self.assertAlmostEqual(avg, 4.0)
             self.assertAlmostEqual(mx, 4.0)
@@ -776,33 +777,33 @@ class TestPeriodColumns(Base):
             g.add(5.0)
         scr = FakeScreen(40, 32)
         nb.draw_bar_graph(scr, 0, g, 1, 30, "toks", {})
-        # the MhHDL labels sit on the baseline row under the summary columns
-        lab = [w for w in scr.writes if w[2] == "MhHDL"]
-        self.assertEqual(lab[0][:3], (1, 26, "MhHDL"))
+        # the MhHDWL labels sit on the baseline row under the summary columns
+        lab = [w for w in scr.writes if w[2] == "MhHDWL"]
+        self.assertEqual(lab[0][:3], (1, 25, "MhHDWL"))
         self.assertEqual(lab[0][3], nb.curses.A_DIM)
         # all-5.0 samples: avg = max = full scale, so every summary column
-        # is a full character, dimmed; five columns at x = width-4 .. width
+        # is a full character, dimmed; six columns at x = width-5 .. width
         cols = sorted(x for (y, x, t, a) in scr.writes
-                      if y == 0 and x >= 26 and a == nb.curses.A_DIM)
-        self.assertEqual(cols, [26, 27, 28, 29, 30])
+                      if y == 0 and x >= 25 and a == nb.curses.A_DIM)
+        self.assertEqual(cols, [25, 26, 27, 28, 29, 30])
         base = [w for w in scr.writes
                 if w[0] == 1 and w[1] == 1 and w[2].startswith("─")]
-        self.assertEqual(len(base[0][2]), 25)  # width-5, labels take 5
+        self.assertEqual(len(base[0][2]), 24)  # width-6, labels take 6
 
     def test_I4_max_leaves_window(self):
-        # M window = 120 samples at the 0.5 s default: the spike at
-        # sample 0 must drop out of M's max once 120 newer samples
+        # M window = 600 samples (5 min) at the 0.5 s default: the spike at
+        # sample 0 must drop out of M's max once 600 newer samples
         # arrive, while L (whole life-time) still sees it
         g = nb.Graph(10)
         g.add(100.0)
-        for _ in range(119):
+        for _ in range(599):
             g.add(1.0)
         _, m_max = nb.period_stats(g)[0]
         self.assertAlmostEqual(m_max, 100.0)
-        g.add(1.0)  # 121st sample: the spike slides out of the window
+        g.add(1.0)  # 601st sample: the spike slides out of the window
         _, m_max = nb.period_stats(g)[0]
         self.assertAlmostEqual(m_max, 1.0)
-        _, l_max = nb.period_stats(g)[4]
+        _, l_max = nb.period_stats(g)[5]
         self.assertAlmostEqual(l_max, 100.0)
 
     def test_I6_all_zero_window_has_no_float_residue(self):
@@ -813,7 +814,7 @@ class TestPeriodColumns(Base):
             g.add(0.0)
         for _ in range(10):
             g.add(123.4567)
-        for _ in range(200):  # the M window (120 samples) goes all zero
+        for _ in range(610):  # the M window (600 samples) goes all zero
             g.add(0.0)
         avg, mx = nb.period_stats(g)[0]
         self.assertEqual(mx, 0.0)
@@ -832,30 +833,53 @@ class TestPeriodColumns(Base):
             g.add(1.0)
         scr = FakeScreen(40, 32)
         nb.draw_bar_graph(scr, 0, g, 1, 30, "toks", {})
-        # width-STAT_COLS = 25 chars = 50 samples * 0.5 s = "25 seconds"
-        span = "25 seconds"
+        # width-STAT_COLS = 24 chars = 48 samples * 0.5 s = "24 seconds"
+        span = "24 seconds"
         lab = [w for w in scr.writes if w[2] == span]
         self.assertEqual(len(lab), 1)
         self.assertEqual(lab[0][0], 1)  # the baseline row
-        self.assertEqual(lab[0][1], 1 + (25 - len(span)) // 2)  # centered
+        self.assertEqual(lab[0][1], 1 + (24 - len(span)) // 2)  # centered
 
-    def test_I5_one_day_buffer_and_lifetime_totals(self):
-        # interval 60 s: the raw history is trimmed to the last day
-        # (1440 samples); after 1500 samples the spike at sample 0 is
-        # gone from the history and from D, but the L column's running
+    def test_I5_one_week_buffer_and_lifetime_totals(self):
+        # interval 60 s: the raw history is trimmed to the last week
+        # (10080 samples); after 10200 samples the spike at sample 0 is
+        # gone from the history and from D/W, but the L column's running
         # total and max still cover the whole process life
         g = nb.Graph(10, interval=60)
         g.add(1000.0)
-        for _ in range(1499):
+        for _ in range(10199):
             g.add(1.0)
-        self.assertEqual(len(g.samples), 1440)
+        self.assertEqual(len(g.samples), 10080)
         stats = nb.period_stats(g)
         _, d_max = stats[3]
         self.assertAlmostEqual(d_max, 1.0)
-        l_avg, l_max = stats[4]
-        self.assertEqual(g.life_count, 1500)
-        self.assertAlmostEqual(l_avg, (1000.0 + 1499 * 1.0) / 1500)
+        _, w_max = stats[4]  # the week window == the kept buffer
+        self.assertAlmostEqual(w_max, 1.0)
+        l_avg, l_max = stats[5]
+        self.assertEqual(g.life_count, 10200)
+        self.assertAlmostEqual(l_avg, (1000.0 + 10199 * 1.0) / 10200)
         self.assertAlmostEqual(l_max, 1000.0)
+
+
+    def test_I8_full_week_buffer_refresh_timing(self):
+        # a full week of 0.5 s samples (1,209,600) exactly fills the raw
+        # buffer; the per-tick period_stats refresh over that full buffer
+        # must stay inside one polling interval, or the UI would stutter
+        # (measured on box hermes: about 26 ms per graph, about 126 ms for
+        # all five graphs per tick)
+        g = nb.Graph(10)
+        n = int(nb.WEEK_SECS / g.interval)
+        for _ in range(n):
+            g.add(1.0)
+        self.assertEqual(len(g.samples), n)  # the buffer holds exactly one week
+        t0 = time.perf_counter()
+        stats = nb.period_stats(g)
+        dt = time.perf_counter() - t0
+        self.assertEqual(len(stats), 6)
+        for avg, mx in stats:
+            self.assertAlmostEqual(avg, 1.0)
+            self.assertAlmostEqual(mx, 1.0)
+        self.assertLess(dt, g.interval)
 
 
 class TestPricingLoader(Base):

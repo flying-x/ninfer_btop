@@ -28,9 +28,10 @@ Polls the engine's Prometheus `/metrics` endpoint and renders:
   (the batch graph stays pinned: one dot = one running request; before the
   first non-zero sample the prefill/decode graphs autoscale to the window
   peak, and the spill/recall rows keep window autoscaling).
-  The rightmost 5 braille columns of each graph summarize trailing windows —
-  `M` last minute, `h` last half-hour, `H` last hour, `D` last day, `L` this
-  monitor run's life-time — labeled `MhHDL` on the baseline row in place of the
+  The rightmost 6 braille columns of each graph summarize trailing windows —
+  `M` last 5 minutes, `h` last half-hour, `H` last hour, `D` last day, `W`
+  last week, `L` this monitor run's
+  life-time — labeled `MhHDWL` on the baseline row in place of the
   dashes, and drawn dimmed (grayed out against the moving bars). Each column's left dot
   line is the window average, its right dot line the window max, in the graph's
   own dot scale; `L` covers this process's life, not the engine's.
