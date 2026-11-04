@@ -17,7 +17,8 @@ import time
 import unittest
 
 import bar_graphs as bg
-import frame_chrome as fc
+import tui
+import ninfer_engine_state as nes
 import metrics_calib as mc
 import ninfer_btop as nb
 
@@ -82,7 +83,7 @@ def rows_with(scr, needle):
 
 
 def make_engine(ok):
-    e = nb.Engine("http://x/metrics", 0.5)
+    e = nes.NinferEngineState("http://x/metrics", 0.5)
     e.ok = ok
     e.last_err = "URLError: [Errno 111] Connection refused"
     e.last_good = 1700000000.0
@@ -205,7 +206,7 @@ class TestEnginePollRate(Base):
         return eng.poll()
 
     def test_C1_rate_produced_below_the_old_250ms_guard(self):
-        eng = nb.Engine("http://x/metrics", interval=0.10)
+        eng = nes.NinferEngineState("http://x/metrics", interval=0.10)
         self.poll(eng, "ninfer_generation_tokens_total 1000\nninfer_engine_ready 1")
         time.sleep(0.10)
         s = self.poll(eng, "ninfer_generation_tokens_total 1100\nninfer_engine_ready 1")
@@ -214,7 +215,7 @@ class TestEnginePollRate(Base):
         self.assertLess(s["toks_per_s"], 1600)
 
     def test_C2_guard_tracks_the_configured_interval(self):
-        eng = nb.Engine("http://x/metrics", interval=0.05)
+        eng = nes.NinferEngineState("http://x/metrics", interval=0.05)
         self.poll(eng, "ninfer_generation_tokens_total 1000\nninfer_engine_ready 1")
         time.sleep(0.05)
         self.poll(eng, "ninfer_generation_tokens_total 1050\nninfer_engine_ready 1")
@@ -223,7 +224,7 @@ class TestEnginePollRate(Base):
         self.assertIsNotNone(s["toks_per_s"])
 
     def test_C3_flat_or_reset_window_is_never_negative(self):
-        eng = nb.Engine("http://x/metrics", interval=0.05)
+        eng = nes.NinferEngineState("http://x/metrics", interval=0.05)
         self.poll(eng, "ninfer_generation_tokens_total 1000\nninfer_engine_ready 1")
         time.sleep(0.06)
         s = self.poll(eng, "ninfer_generation_tokens_total 1000\nninfer_engine_ready 1")
@@ -237,7 +238,7 @@ class TestFrameDownState(Base):
         mc.set_calib(calib)
         scr = FakeScreen(40, 120)
         graphs = {k: bg.Graph(60) for k in ("batch", "toks", "prefill")}
-        fc.frame(scr, make_engine(ok), graphs, {}, calib)
+        tui.frame(scr, make_engine(ok), graphs, {}, calib)
         return scr
 
     def test_D1_down_calibrated_banner_and_panels_disjoint(self):
@@ -275,11 +276,11 @@ class TestFrameDownState(Base):
 class TestPureFunctions(Base):
     def test_E1_draw_panel_keeps_the_last_title_char(self):
         scr = FakeScreen(40, 120)
-        fc.draw_panel(scr, 0, "Token totals", "title", {}, width=40)
+        tui.draw_panel(scr, 0, "Token totals", "title", {}, width=40)
         row = [t for (y, x, t, a) in scr.writes if y == 0][0]
         self.assertTrue(row.startswith("─Token totals"), row)
         scr2 = FakeScreen(40, 120)
-        fc.draw_panel(scr2, 0, "ABCDEFGHIJKLMNOP", "title", {}, width=18)
+        tui.draw_panel(scr2, 0, "ABCDEFGHIJKLMNOP", "title", {}, width=18)
         row2 = [t for (y, x, t, a) in scr2.writes if y == 0][0]
         self.assertEqual(row2, "─ABCDEFGHIJKLMNOP")
 
@@ -301,7 +302,7 @@ class TestPureFunctions(Base):
             "ninfer_generation_tokens_total %d" % (prompt_total, cached, gen)
         )
         fake_metrics(body)
-        s = nb.Engine("http://x/metrics", 0.5).poll()
+        s = nes.NinferEngineState("http://x/metrics", 0.5).poll()
         expected = ((prompt_total - cached) / 1e6 * mc.CLOUD_IN_RATE
                     + cached / 1e6 * mc.CLOUD_CACHE_RATE
                     + gen / 1e6 * mc.CLOUD_OUT_RATE)
@@ -315,7 +316,7 @@ class TestMetricStatBanner(Base):
         g = bg.Graph(10)
         for v in (2, 8, 4, 6, 0):
             g.add(v)
-        segs = fc.metric_stat_segments(g, "4")
+        segs = tui.metric_stat_segments(g, "4")
         self.assertEqual("".join(t for t, _ in segs),
                            "(cur=4,max=8,peak=8,avg=4,min=0)")
         flags = [flag for _, flag in segs]
@@ -323,15 +324,15 @@ class TestMetricStatBanner(Base):
         self.assertTrue(next(t for t, flag in segs if flag).startswith(",max="))
 
     def test_F2_empty_window_has_no_banner_suffix(self):
-        self.assertEqual(fc.metric_stat_segments(bg.Graph(10), "—"), [])
+        self.assertEqual(tui.metric_stat_segments(bg.Graph(10), "—"), [])
 
     def test_F3_draw_panel_paints_max_in_peak_color(self):
         g = bg.Graph(10)
         for v in (2, 8, 4):
             g.add(v)
         scr = FakeScreen(40, 120)
-        fc.draw_panel(scr, 0, "Batch size  (ninfer_requests_running)", "batch", {}, 120,
-                      stats=fc.metric_stat_segments(g, "4"))
+        tui.draw_panel(scr, 0, "Batch size  (ninfer_requests_running)", "batch", {}, 120,
+                      stats=tui.metric_stat_segments(g, "4"))
         row = [w for w in scr.writes if w[0] == 0]
         joined = "".join(w[2] for w in row)
         for token in ("cur=4", "max=8", "peak=8", "avg=", "min="):
@@ -354,7 +355,7 @@ class TestMetricStatBanner(Base):
         # window max included - is painted with the panel's base color
         # (0 under the colorless stub; a highlighted char would be A_REVERSE)
         scr = FakeScreen(40, 120)
-        fc.draw_bar_graph(scr, 0, g, 2, 50, "toks", {})
+        tui.draw_bar_graph(scr, 0, g, 2, 50, "toks", {})
         # the moving bars (x <= width-STAT_COLS) are painted in the base
         # color; the MhHDWL summary columns on the right are dimmed
         glyphs = [w for w in scr.writes
@@ -382,8 +383,8 @@ class TestCacheHealth(Base):
                 "ninfer_context_pool_live_bytes{rank=\"0\",domain=\"host\",kind=\"cached\"} 8000000000\n"
                 "ninfer_context_pool_peak_bytes{rank=\"0\",domain=\"host\"} 8000000000\n"
                 "ninfer_max_context_tokens 131072\n")
-        nb._fetch = fake_metrics(body)
-        s = nb.Engine("http://x/metrics", 0.5).poll()
+        fake_metrics(body)
+        s = nes.NinferEngineState("http://x/metrics", 0.5).poll()
         self.assertAlmostEqual(s["tok_hit"], 0.10)          # 100000/1000000
         self.assertAlmostEqual(s["req_hit"], 0.25)          # 1/(1+3)
         self.assertEqual(s["host_cached"], 8e9)             # pool pinned: all cached
@@ -403,7 +404,7 @@ class TestCacheHealth(Base):
         eng.start_time = None
         graphs = {k: bg.Graph(60) for k in ("batch", "toks", "prefill")}
         scr = FakeScreen(40, 120)
-        fc.frame(scr, eng, graphs, c)
+        tui.frame(scr, eng, graphs, c)
         self.assertTrue(rows_with(scr, "Device KV"))
         self.assertTrue(rows_with(scr, "Host KV"))
         self.assertTrue(rows_with(scr, "Cache (checkpoint reuse)"))
@@ -421,8 +422,8 @@ class TestCacheHealth(Base):
                 "ninfer_prompt_tokens_cached_total 100000\n"
                 "ninfer_prefill_tokens_total 900000\n"
                 "ninfer_context_transfer_bytes_total{resource=\"kv\",pool_id=\"0\",direction=\"h2d\"} 8000000\n")
-        nb._fetch = fake_metrics(body)
-        s = nb.Engine("http://x/metrics", 0.5).poll()
+        fake_metrics(body)
+        s = nes.NinferEngineState("http://x/metrics", 0.5).poll()
         self.assertAlmostEqual(s["tok_host"], 8000 / 1000000)
         self.assertAlmostEqual(s["tok_dev"], 92000 / 1000000)
         self.assertAlmostEqual(s["tok_dev"] + s["tok_host"], s["tok_hit"])
@@ -435,8 +436,8 @@ class TestCacheHealth(Base):
                 "ninfer_prompt_tokens_total 1000000\n"
                 "ninfer_prompt_tokens_cached_total 100000\n"
                 "ninfer_context_transfer_bytes_total{resource=\"kv\",pool_id=\"0\",direction=\"h2d\"} 200000000\n")
-        nb._fetch = fake_metrics(body)
-        s = nb.Engine("http://x/metrics", 0.5).poll()
+        fake_metrics(body)
+        s = nes.NinferEngineState("http://x/metrics", 0.5).poll()
         self.assertAlmostEqual(s["tok_host"], s["tok_hit"])
         self.assertAlmostEqual(s["tok_dev"], 0.0)
 
@@ -450,7 +451,7 @@ class TestCacheHealth(Base):
         eng.last_frame = s
         graphs = {k: bg.Graph(60) for k in ("batch", "toks", "prefill")}
         scr = FakeScreen(40, 120)
-        fc.frame(scr, eng, graphs, c)
+        tui.frame(scr, eng, graphs, c)
         joined = "".join(t for (_, _, t, _) in scr.writes)
         # the line must fit the 38-char column at 120 cols: no space between
         # the two groups, both labels fully visible
@@ -461,8 +462,8 @@ class TestCacheHealth(Base):
         body = ("ninfer_engine_ready 1\n"
                 "ninfer_prompt_tokens_total 1000000\n"
                 "ninfer_prompt_tokens_cached_total 100000\n")
-        nb._fetch = fake_metrics(body)
-        s = nb.Engine("http://x/metrics", 0.5).poll()
+        fake_metrics(body)
+        s = nes.NinferEngineState("http://x/metrics", 0.5).poll()
         self.assertIsNone(s["tok_dev"])
         self.assertIsNone(s["tok_host"])
         nb.curses.color_pair = lambda i: 1 + i
@@ -473,7 +474,7 @@ class TestCacheHealth(Base):
         eng.last_frame = self._sample()
         graphs = {k: bg.Graph(60) for k in ("batch", "toks", "prefill")}
         scr = FakeScreen(40, 120)
-        fc.frame(scr, eng, graphs, c)
+        tui.frame(scr, eng, graphs, c)
         self.assertFalse(rows_with(scr, "(device)"))
         self.assertTrue(rows_with(scr, "Tok hit"))
 
@@ -487,14 +488,14 @@ class TestCacheHealth(Base):
         # paused = 2 -> the "paused 2" segment carries the 'bad' (red) pair
         eng.last_frame = self._sample(paused=2)
         scr = FakeScreen(40, 120)
-        fc.frame(scr, eng, graphs, c)
+        tui.frame(scr, eng, graphs, c)
         bad_attr = 1 + c["bad"]
         self.assertTrue(any("paused 2" in t and a == bad_attr
                             for (_, _, t, a) in scr.writes))
         # paused = 0 -> the same segment is painted with the default color
         eng.last_frame = self._sample(paused=0)
         scr = FakeScreen(40, 120)
-        fc.frame(scr, eng, graphs, c)
+        tui.frame(scr, eng, graphs, c)
         self.assertTrue(any("paused 0" in t and a == 0
                             for (_, _, t, a) in scr.writes))
 
@@ -510,7 +511,7 @@ class TestCacheHealth(Base):
         eng.start_time = None
         graphs = {k: bg.Graph(60) for k in ("batch", "toks", "prefill")}
         scr = FakeScreen(40, 120)
-        fc.frame(scr, eng, graphs, c, mc.get_calib())
+        tui.frame(scr, eng, graphs, c, mc.get_calib())
         row1 = "".join(t for (y, x, t, a) in scr.writes if y == 1)
         self.assertIn("calibrated in", row1)
         self.assertIn("ctx 128.0 KiToks", row1)
@@ -526,7 +527,7 @@ class TestCacheHealth(Base):
         eng.start_time = None
         graphs = {k: bg.Graph(60) for k in ("batch", "toks", "prefill")}
         scr = FakeScreen(40, 120)
-        fc.frame(scr, eng, graphs, c, mc.get_calib())
+        tui.frame(scr, eng, graphs, c, mc.get_calib())
         row1 = "".join(t for (y, x, t, a) in scr.writes if y == 1)
         self.assertIn("calibrated in", row1)
         self.assertNotIn("KiToks", row1)
@@ -539,7 +540,7 @@ class TestCacheHealth(Base):
         eng.start_time = None
         graphs = {k: bg.Graph(60) for k in ("batch", "toks", "prefill")}
         scr = FakeScreen(40, 120)
-        fc.frame(scr, eng, graphs, {})
+        tui.frame(scr, eng, graphs, {})
         row1 = "".join(t for (y, x, t, a) in scr.writes if y == 1)
         self.assertIn("128.0 KiToks", row1)
 
@@ -551,8 +552,8 @@ class TestCacheHealth(Base):
                 "ninfer_prompt_tokens_total 1000000\n"
                 "ninfer_prompt_tokens_cached_total 100000\n"
                 "ninfer_context_transfer_bytes_total{resource=\"kv\",pool_id=\"0\",direction=\"h2d\"} 30000000\n")
-        nb._fetch = fake_metrics(body)
-        s = nb.Engine("http://x/metrics", 0.5).poll()
+        fake_metrics(body)
+        s = nes.NinferEngineState("http://x/metrics", 0.5).poll()
         # 30MB / 1000 B/tok = 30000 host-served tokens
         self.assertAlmostEqual(s["tok_host"], 30000 / 1000000)
         self.assertIsNone(s["util"])
@@ -583,8 +584,8 @@ class TestXferSpillRecall(Base):
 
     def test_H2_poll_computes_spill_and_recall_rates(self):
         t = [1000.0]
-        real_mono = nb.time.monotonic
-        nb.time.monotonic = lambda: t[0]
+        real_mono = time.monotonic
+        time.monotonic = lambda: t[0]
         try:
             b0 = ('ninfer_engine_ready 1\n'
                   'ninfer_context_transfer_bytes_total{resource="state",direction="d2h"} 100\n'
@@ -592,7 +593,7 @@ class TestXferSpillRecall(Base):
             b1 = ('ninfer_engine_ready 1\n'
                   'ninfer_context_transfer_bytes_total{resource="state",direction="d2h"} 300\n'
                   'ninfer_context_transfer_bytes_total{resource="state",direction="h2d"} 70\n')
-            e = nb.Engine("http://x/metrics", 0.5)
+            e = nes.NinferEngineState("http://x/metrics", 0.5)
             fake_metrics(b0)
             s0 = e.poll()
             self.assertIsNone(s0["spill_rate"])    # first poll: no prior sample
@@ -603,7 +604,7 @@ class TestXferSpillRecall(Base):
             self.assertAlmostEqual(s1["spill_rate"], (300 - 100) / 1.0)   # 200 B/s
             self.assertAlmostEqual(s1["recall_rate"], (70 - 40) / 1.0)    # 30 B/s
         finally:
-            nb.time.monotonic = real_mono
+            time.monotonic = real_mono
 
     def test_H3_frame_renders_spill_recall_xfer_graphs(self):
         nb.curses.color_pair = lambda i: 1 + i
@@ -624,7 +625,7 @@ class TestXferSpillRecall(Base):
         graphs["xfer_d2h"] = d2h
         graphs["xfer_h2d"] = h2d
         scr = FakeScreen(40, 120)
-        fc.frame(scr, eng, graphs, c)
+        tui.frame(scr, eng, graphs, c)
         self.assertTrue(rows_with(scr, "Spill"))
         self.assertTrue(rows_with(scr, "Recall"))
         spill = next(t for (_, _, t, _) in scr.writes if "Spill" in t)
@@ -644,20 +645,20 @@ class TestXferSpillRecall(Base):
         g = bg.Graph(26)
         for _ in range(26):
             g.add(0.0)
-        self.assertEqual(nb._xfer_row("  X  ", g),
+        self.assertEqual(tui._xfer_row("  X  ", g),
                          "  X  " + " " * 13 + " " + "0B/s")
         # a burst autoscales against its own window peak, not a shared one
         g2 = bg.Graph(26)
         for v in [0.0] * 11 + [5.0] * 4 + [0.0] * 11:
             g2.add(v)
-        row = nb._xfer_row("  X  ", g2)
+        row = tui._xfer_row("  X  ", g2)
         self.assertIn("⣿", row)            # 5 B/s burst = its own peak
         self.assertTrue(row.endswith("5B/s"))
         # no graph yet (first frames): dash placeholder
-        self.assertEqual(nb._xfer_row("  X  ", None), "  X  " + " " * 14 + "—")
+        self.assertEqual(tui._xfer_row("  X  ", None), "  X  " + " " * 14 + "—")
         # rate label formatting is unchanged
-        self.assertEqual(nb._rate_val(None), "   —")
-        self.assertEqual(nb._rate_val(12_400_000.0), "12.40MB/s")
+        self.assertEqual(tui._rate_val(None), "   —")
+        self.assertEqual(tui._rate_val(12_400_000.0), "12.40MB/s")
 
 
 # --------------------- J. batch panel height follows max concurrency
@@ -673,7 +674,7 @@ class TestBatchHeight(Base):
         eng.last_frame = self._sample()
         graphs = {"batch": bg.Graph(60, floor=floor),
                   "toks": bg.Graph(60), "prefill": bg.Graph(60)}
-        fc.frame(scr, eng, graphs, {}, calib)
+        tui.frame(scr, eng, graphs, {}, calib)
         b = min(rows_with(scr, "Batch size"))
         p = min(rows_with(scr, "Prefill t/s"))
         # title row + N graph rows + baseline row, then the next panel title
@@ -780,7 +781,7 @@ class TestPeriodColumns(Base):
         for _ in range(30):
             g.add(5.0)
         scr = FakeScreen(40, 32)
-        fc.draw_bar_graph(scr, 0, g, 1, 30, "toks", {})
+        tui.draw_bar_graph(scr, 0, g, 1, 30, "toks", {})
         # the MhHDWL labels sit on the baseline row under the summary columns
         lab = [w for w in scr.writes if w[2] == "MhHDWL"]
         self.assertEqual(lab[0][:3], (1, 25, "MhHDWL"))
@@ -836,7 +837,7 @@ class TestPeriodColumns(Base):
         for _ in range(30):
             g.add(1.0)
         scr = FakeScreen(40, 32)
-        fc.draw_bar_graph(scr, 0, g, 1, 30, "toks", {})
+        tui.draw_bar_graph(scr, 0, g, 1, 30, "toks", {})
         # width-STAT_COLS = 24 chars = 48 samples * 0.5 s = "24 seconds"
         span = "24 seconds"
         lab = [w for w in scr.writes if w[2] == span]
@@ -989,8 +990,8 @@ class TestPricingLoader(Base):
                 "ninfer_prompt_tokens_cached_total 100000\n"
                 "ninfer_generation_tokens_total 500000")
         fake_metrics(body)
-        s_def = nb.Engine("http://x/metrics", 0.5).poll()
-        s_llm = nb.Engine("http://x/metrics", 0.5, p["llama-3-8b"]).poll()
+        s_def = nes.NinferEngineState("http://x/metrics", 0.5).poll()
+        s_llm = nes.NinferEngineState("http://x/metrics", 0.5, p["llama-3-8b"]).poll()
         self.assertNotAlmostEqual(s_def["cloud_cost"], s_llm["cloud_cost"])
         want = ((1000000 - 100000) / 1e6 * 0.2
                 + 100000 / 1e6 * 0.02
@@ -1016,7 +1017,7 @@ class TestPricingLoader(Base):
             os.unlink(path)
 
     def test_I5_bare_engine_uses_default_rates(self):
-        eng = nb.Engine("http://x/metrics", 0.5)  # no rates supplied
+        eng = nes.NinferEngineState("http://x/metrics", 0.5)  # no rates supplied
         self.assertEqual(eng.rates,
                          {"input": 0.5, "cached_input": 0.05, "output": 3.0})
         self.assertEqual(eng.rates, dict(mc.DEFAULT_PRICING["qwen3.8-27b"]))

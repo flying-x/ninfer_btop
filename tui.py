@@ -7,23 +7,20 @@ fighting the bar-graph / KV-cache data code for the same file.
 
 Dependency direction: this module imports metrics_calib (the
 metrics/calibration helpers) and bar_graphs (Graph, dot/braille rendering,
-period stats - both stdlib-only leaves), plus ninfer_btop (Engine, shared
-helpers); ninfer_btop imports THIS module only lazily, inside main(). So
-`import ninfer_btop` alone never pulls in the curses screen code. frame()
-takes the resolved calibration dict as a value (calib) instead of reading
-metrics_calib's calibration state (get_calib()).
+period stats - both stdlib-only leaves) plus ninfer_engine_state
+(NinferEngineState, the engine's live state); the cache panel's row builders
+(_xfer_row, _rate_val, _kv_row) and XFER_COLS are defined here with the rest
+of the row/column geometry. ninfer_btop imports THIS module only lazily,
+inside main(). So `import ninfer_btop` alone never pulls in the curses
+screen code. frame() takes the resolved calibration dict as a value (calib)
+instead of reading metrics_calib's calibration state (get_calib()).
 """
 import curses
 import time
 
 from bar_graphs import Graph, compute_dots, dots_to_chars, period_stats
 from metrics_calib import human, money
-from ninfer_btop import (
-    Engine,
-    XFER_COLS,
-    _kv_row,
-    _xfer_row,
-)
+from ninfer_engine_state import NinferEngineState
 
 # ---------------------------------------------------------------- text mode
 
@@ -41,7 +38,7 @@ def _pool_body(cap, inuse, cached, peak):
 
 
 def run_text(url, rates=None, label=None):
-    eng = Engine(url, rates=rates, label=label)
+    eng = NinferEngineState(url, rates=rates, label=label)
     s = eng.poll()
     if s is None:
         print(f"error: cannot reach {url}: {eng.last_err}")
@@ -307,6 +304,51 @@ MAX_PLOT_ROWS = 6
 MIN_WIDTH = 20
 # footer UTIL colour thresholds: "ok" below warn, "toks" below bad, "bad" at/above
 UTIL_WARN, UTIL_BAD = 0.7, 0.9
+# width of the one-row spill/recall graphs in characters; fixed and
+# independent of the terminal width (buffer = 2 samples per character)
+XFER_COLS = 13
+
+
+def _xfer_row(label, graph, width=XFER_COLS):
+    """One cache-panel transfer row: a one-row braille graph over the
+    graph's window (the same dots and double-wide characters as the main
+    bar graphs - each character holds two adjacent samples, the newer in
+    the left dot line), autoscaled to its own window peak, with that peak
+    as the side label for scale. Unlike a one-poll bar, a sub-frame transfer burst (a few-MS
+    recall DMA) stays visible for the whole graph window. The row is label
+    + width + 1 + the peak label, which at 120 cols fits the ⅓-width cache
+    column with the longest label (…MB/s, 10 chars). Like the main graphs
+    the newest sample is on the left, and a partial window grows from that
+    edge."""
+    if graph is None:
+        return label + " " * (width + 1) + "—"
+    hist = list(graph.hist)
+    n = min(2 * width, len(hist))
+    hist = hist[-n:]  # the newest n samples (the row reads newest first)
+    dots = compute_dots(hist, total_dots=4)  # autoscale to its own window peak
+    vals = [v for v in hist if v is not None]
+    mx = max(vals) if vals else 0.0
+    if n % 2:
+        dots.append(0)
+    chars = "".join(dots_to_chars(dots[::-1], 1)[0]).ljust(width)  # partial window grows from the left
+    return label + chars + " " + _rate_val(mx)
+
+
+def _rate_val(rate):
+    """Human rate label for a transfer rate; an em dash when there is no data."""
+    if rate is None:
+        return "   —"
+    return human(rate, "B/s")
+
+
+def _kv_row(label, val, cap):
+    """Labeled context-pool row for the Device KV / Host KV panels: value plus
+    the share of pool capacity; 'n/a' when the engine build does not report a
+    pool capacity for that domain."""
+    if not cap:
+        return f"  {label:<9} : n/a"
+    pct = f"  ({val / cap * 100:4.1f}%)" if val else ""
+    return f"  {label:<9} : {human(val)}{pct}"
 
 
 def frame(scr, eng, graphs, c, calib=None):
@@ -581,7 +623,7 @@ def main_loop(stdscr, args, calib=None):
               # transfer graphs: fixed XFER_COLS-char width (2 samples per char,
               # ~13 s at the default 500 ms poll), independent of terminal width
               "xfer_d2h": Graph(2 * XFER_COLS), "xfer_h2d": Graph(2 * XFER_COLS)}
-    eng = Engine(args.url, interval, args.pricing_rates, label=args.pricing_model)
+    eng = NinferEngineState(args.url, interval, args.pricing_rates, label=args.pricing_model)
     last_poll = 0.0
     running = True
 

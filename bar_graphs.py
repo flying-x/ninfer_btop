@@ -8,7 +8,7 @@ and chrome code for the same file.
 
 Dependency direction: a TRUE LEAF - this module imports stdlib only, so
 `import bar_graphs` is cycle-free from anywhere. ninfer_btop (the
-transfer-row rendering) and frame_chrome (the Graph construction and
+transfer-row rendering) and tui (the Graph construction and
 draw path) import from here; it imports neither of them. Screen layout
 (column geometry, STAT_LABEL / STAT_COLS) is chrome's; the width simply
 flows in as the Graph constructor argument.

@@ -5,15 +5,16 @@ cloud-API pricing data.
 
 Extracted from ninfer_btop.py so metrics/calibration edits stop fighting
 the dashboard code for the same file. Stdlib-only leaf: imports nothing
-from ninfer_btop / frame_chrome / bar_graphs; both of them import THIS
+from ninfer_btop / tui / bar_graphs; both of them import THIS
 module at top level.
 
 The live calibration state is private (_CALIB), set at startup by
 resolve_calib() (cache hit or fresh benchmark) and accessed only
 through the get_calib()/set_calib() pair - consumers must not bind the
-value, because the writers re-bind it. ninfer_btop's Engine reads it
-per poll (lifetime utilization, the bytes-per-token tier split); main()
-passes get_calib()'s current value to the chrome as a value.
+value, because the writers re-bind it. ninfer_engine_state's
+NinferEngineState reads it per poll (lifetime utilization, the
+bytes-per-token tier split); main() passes get_calib()'s current value to
+the chrome as a value.
 """
 import json
 import os
