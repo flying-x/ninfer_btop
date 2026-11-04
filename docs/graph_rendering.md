@@ -57,6 +57,10 @@ Resolves dot heights into braille characters, the way btop does:
   in the panel's base color. The window max is highlighted as the `max=`
   token in the panel title banner; the lifetime peak sits beside it as a
   plain `peak=` token and is what scales the graph.
+ - The baseline row under the plot is labeled in its middle with the time
+   span the plot region covers: two samples per character, so the span is
+   `2 * (width - STAT_COLS) * interval` seconds ("114 seconds" at the
+   default 119-column width and 0.5 s poll).
 
 ## Period summary columns (MhHDL)
 

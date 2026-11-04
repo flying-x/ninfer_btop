@@ -1152,9 +1152,19 @@ def draw_bar_graph(scr, y, graph: Graph, rows, width, key, c):
                     scr.addstr(y + r, width - STAT_COLS + 1 + col, ch, stat_attr)
                 except curses.error:
                     pass
-    # baseline; the period labels sit under their summary columns
+    # baseline; the period labels sit under their summary columns and a
+    # time-window label sits in the middle of the plot: two samples per
+    # character, so the region spans 2*(width-STAT_COLS) samples
+    plot_len = width - STAT_COLS
     try:
-        scr.addnstr(y + rows, 1, "─" * (width - STAT_COLS), width - STAT_COLS)
+        scr.addnstr(y + rows, 1, "─" * plot_len, plot_len)
+    except curses.error:
+        pass
+    span = f"{2 * plot_len * graph.interval:g} seconds"
+    x = max(1, 1 + (plot_len - len(span)) // 2)
+    try:
+        scr.addnstr(y + rows, x, span, plot_len - (x - 1),
+                    curses.color_pair(c.get("dim", 0)))
     except curses.error:
         pass
     if stats:

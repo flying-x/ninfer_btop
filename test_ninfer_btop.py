@@ -824,6 +824,21 @@ class TestPeriodColumns(Base):
         self.assertEqual(mx, 500.0)
         self.assertGreater(avg, 0.0)
 
+    def test_I7_baseline_time_span_label(self):
+        # the baseline carries a centered label of the time span the plot
+        # region covers: 2 samples per character * interval
+        g = nb.Graph(20)
+        for _ in range(30):
+            g.add(1.0)
+        scr = FakeScreen(40, 32)
+        nb.draw_bar_graph(scr, 0, g, 1, 30, "toks", {})
+        # width-STAT_COLS = 25 chars = 50 samples * 0.5 s = "25 seconds"
+        span = "25 seconds"
+        lab = [w for w in scr.writes if w[2] == span]
+        self.assertEqual(len(lab), 1)
+        self.assertEqual(lab[0][0], 1)  # the baseline row
+        self.assertEqual(lab[0][1], 1 + (25 - len(span)) // 2)  # centered
+
     def test_I5_one_day_buffer_and_lifetime_totals(self):
         # interval 60 s: the raw history is trimmed to the last day
         # (1440 samples); after 1500 samples the spike at sample 0 is
