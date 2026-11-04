@@ -136,13 +136,11 @@ Reusable rules distilled from this implementation:
   newest edge.
 - Verify scroll motion mechanically: drive scripted traffic, capture the
   terminal (`tmux capture-pane -e -p`) at several timestamps, and inspect
-  the SGR codes. This repo ships `bar_graph_test.py` (`--text` for a
-  non-TUI check) and `hero_render.py` (terminal capture -> PNG).
+  the SGR codes. This repo ships `hero_render.py` (terminal capture -> PNG).
 
 ## Testing
 
-- `test_ninfer_btop.py` covers the unit behavior (J tests for
-  `compute_dots`/`dots_to_chars`, H tests for the frame integration,
-  I tests for the MhHDWL period summary columns).
-- `bar_graph_test.py` is a visual tester: run it against a live endpoint
-  (or with `--text`) to watch the scroll motion and glyph texture.
+- `test_ninfer_btop.py` covers the unit behavior: J tests pin the batch
+  graph's `compute_dots` scaling, H tests the spill/recall transfer rows,
+  and I tests the MhHDWL period summary columns; the paired braille
+  rendering of `dots_to_chars` rides along through every drawn row.

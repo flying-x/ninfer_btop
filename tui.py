@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
-"""ninfer_btop chrome: screen composition and display code.
+"""ninfer_btop tui: the curses screen layer of the dashboard.
 
-Extracted from ninfer_btop.py so chrome edits (frame layout, status
-line, footer, colors/attributes, --text output, the main loop) stop
-fighting the bar-graph / KV-cache data code for the same file.
+Screen composition and display code: frame layout, status line and footer,
+colors/attributes, the MhHDWL period-summary column geometry (STAT_LABEL /
+STAT_COLS), the cache panel's row builders (_xfer_row, _rate_val, _kv_row,
+XFER_COLS), the --text output, and the main_loop event loop.
 
-Dependency direction: this module imports metrics_calib (the
-metrics/calibration helpers) and bar_graphs (Graph, dot/braille rendering,
-period stats - both stdlib-only leaves) plus ninfer_engine_state
-(NinferEngineState, the engine's live state); the cache panel's row builders
-(_xfer_row, _rate_val, _kv_row) and XFER_COLS are defined here with the rest
-of the row/column geometry. ninfer_btop imports THIS module only lazily,
-inside main(). So `import ninfer_btop` alone never pulls in the curses
-screen code. frame() takes the resolved calibration dict as a value (calib)
-instead of reading metrics_calib's calibration state (get_calib()).
+Imports ninfer_engine_state (NinferEngineState, the engine's live state)
+and the two stdlib-only leaves metrics_calib (formatting helpers) and
+bar_graphs (Graph, dot/braille rendering, period stats); ninfer_btop
+imports THIS module eagerly at top level (main_loop, run_text) and nothing
+else in the tree is above it, so the import graph stays acyclic.
+frame() takes the resolved calibration dict as a value instead of reading
+metrics_calib's calibration state, so the render layer never binds it.
 """
 import curses
 import time

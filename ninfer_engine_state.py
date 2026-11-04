@@ -1,15 +1,12 @@
-"""ninfer_btop engine state: the engine's live state.
+"""ninfer_btop engine state: the engine's live state, refreshed per poll.
 
-NinferEngineState: the poll loop over the engine's /metrics endpoint (rates,
-labels, the unified context pool per domain, cache hits, the device/host
-tier split, the spill/recall transfer rates).
+NinferEngineState: the poll loop over the engine's /metrics endpoint -
+tokens/s rates, gauge labels, the unified context pool per domain, cache
+hits, the device/host tier split, and the spill/recall transfer rates.
 
-Extracted from ninfer_btop.py so engine-state edits stop fighting the chrome
-render code for the same file; the cache panel's row builders (_xfer_row,
-_rate_val, _kv_row, XFER_COLS) live in tui.py, where the rest of
-the row/column geometry sits. Imports only the stdlib-only leaf metrics_calib
-(the /metrics client, the calibration cache); it imports neither ninfer_btop
-nor tui, so `import ninfer_engine_state` is cycle-free.
+Imports only the stdlib-only leaf metrics_calib (the /metrics client and
+calibration cache); it imports neither ninfer_btop nor tui, so
+`import ninfer_engine_state` is cycle-free.
 """
 import time
 

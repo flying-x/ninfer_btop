@@ -3,18 +3,13 @@
 startup benchmark, the ~/.ninfer_btop.json calibration cache, and the
 cloud-API pricing data.
 
-Extracted from ninfer_btop.py so metrics/calibration edits stop fighting
-the dashboard code for the same file. Stdlib-only leaf: imports nothing
-from ninfer_btop / tui / bar_graphs; both of them import THIS
-module at top level.
+Stdlib-only leaf: imports nothing from the rest of the project; both
+ninfer_btop and tui import this module at top level.
 
-The live calibration state is private (_CALIB), set at startup by
-resolve_calib() (cache hit or fresh benchmark) and accessed only
-through the get_calib()/set_calib() pair - consumers must not bind the
-value, because the writers re-bind it. ninfer_engine_state's
-NinferEngineState reads it per poll (lifetime utilization, the
-bytes-per-token tier split); main() passes get_calib()'s current value to
-the chrome as a value.
+The live calibration state is private (_CALIB): set at startup by
+resolve_calib() (cache hit or fresh benchmark) and reached only through
+the get_calib()/set_calib() accessors - consumers read them per use and
+never bind the value, because the writers re-bind it.
 """
 import json
 import os

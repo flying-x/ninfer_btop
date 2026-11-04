@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """ninfer_btop bar graphs: sample history and dot/braille rendering.
 
-Extracted from ninfer_btop.py so the bar-graph data code (the Graph raw
-history with its period-stat block tables, dot scaling, braille
-rendering, and the M/h/H/D/W/L period stats) stops fighting the engine
-and chrome code for the same file.
+Graph (the raw sample history with its period-stat block tables),
+compute_dots (dot scaling), dots_to_chars (paired braille rendering), and
+period_stats (the M/h/H/D/W/L summary figures).
 
-Dependency direction: a TRUE LEAF - this module imports stdlib only, so
-`import bar_graphs` is cycle-free from anywhere. ninfer_btop (the
-transfer-row rendering) and tui (the Graph construction and
-draw path) import from here; it imports neither of them. Screen layout
-(column geometry, STAT_LABEL / STAT_COLS) is chrome's; the width simply
-flows in as the Graph constructor argument.
+Stdlib-only leaf: imports nothing from the rest of the project; tui
+imports from here, so every `import bar_graphs` is cycle-free.
+Invariants: compute_dots gives every non-zero sample at least one dot and
+clips at the plot's total dot count; one braille character holds a pair of
+adjacent samples (the newer in the left dot line, odd counts padded with a
+trailing zero), so each poll shifts the graph exactly half a character;
+the M/h/H/D/W summaries are exact functions of the one-week block-
+partitioned history, while L is an append-only running total over the
+process life.
 """
 import array
 import builtins
