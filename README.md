@@ -80,7 +80,7 @@ python3 ninfer_btop.py --url URL [-i INTERVAL_MS] [--text] [--re-calib]
 
 - `--url`   metrics endpoint (required)
 - `-i`      poll interval in ms (default 500); each poll shifts the bar graphs by
-  exactly one character
+  half a character (one dot line)
 - `--text`  one-shot plain-text stats, no TUI
 - `--re-calib`  drop the `~/.ninfer_btop.json` calibration cache and re-run the
   startup benchmark (by default the cache is reused while the engine's start time

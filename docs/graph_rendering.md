@@ -71,15 +71,18 @@ would run (the dashes fill the scrolling area only):
 - **M** last 5 minutes, **h** last half-hour, **H** last hour, **D** last
   day, **W** last week, **L** this monitor process's life-time. The
   windows are counted in poll intervals (e.g. at the default 0.5 s poll:
-  M = 300 samples); a period longer than the process life clamps to all
+  M = 600 samples); a period longer than the process life clamps to all
   available samples; W spans the kept one-week buffer.
   The figures cover **this monitor run**, not the engine's life.
 - Each column is one double-wide braille character: the **left dot line
   is the period average, the right dot line the period max**. The M/h/H/D/W
   figures are recomputed from the one-week raw history buffer (trimmed to
-  the last week; W spans the whole kept buffer) on every poll - a few milliseconds per graph - so the
-  displayed figures are exact functions of the stored samples and cannot
-  drift from accumulated float error. L is a separate running total and
+  the last week; W spans the whole kept buffer) on every poll - via small
+  per-graph block tables (a partial sum and an exact max per 1024-sample
+  block, so a window is a few table rows plus at most two partial block
+  edges rather than a full rescan; a fraction of a millisecond per graph) -
+  so the displayed figures are exact functions of the stored samples and
+  cannot drift from accumulated float error. L is a separate running total and
   max over the whole process life (plain scalars - its window never
   shrinks). Memory is bounded (about 5 MB per graph at the default
   0.5 s poll), no matter how long the process runs. Blanks count as 0,
@@ -124,10 +127,11 @@ Reusable rules distilled from this implementation:
   buffer on every poll instead of maintaining running aggregates
   incrementally: repeated add/subtract on floats leaves residue
   (a phantom ~1e-5 sum in an all-zero window lights a phantom average
-  dot while the max shows none), and a rescan of a bounded buffer costs
-  a few milliseconds. L (whole life) exceeds the buffer, so it stays
-  append-only scalars - a running total that is only ever added to, and
-  a scalar max.
+  dot while the max shows none), and the recomputation over a bounded
+  buffer - a few cached per-block rows plus at most two partial block
+  edges, not a full rescan - costs a fraction of a millisecond. L
+  (whole life) exceeds the buffer, so it stays append-only scalars - a
+  running total that is only ever added to, and a scalar max.
 - Size buffers to 2x the character width and grow partial windows from the
   newest edge.
 - Verify scroll motion mechanically: drive scripted traffic, capture the

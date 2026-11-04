@@ -5,6 +5,7 @@ deterministic /metrics bodies, and the curses screen is a recorder.
 
 Run:  python3 -m unittest -v test_ninfer_btop
 """
+import array
 import contextlib
 import io
 import json
@@ -875,11 +876,53 @@ class TestPeriodColumns(Base):
         t0 = time.perf_counter()
         stats = nb.period_stats(g)
         dt = time.perf_counter() - t0
+        print(f"I8 full-week refresh: {len(g.samples):,} samples, "
+              f"period_stats {dt * 1000:.3f} ms "
+              f"({dt / g.interval * 100:.2f}% of the {g.interval:.1f}s interval)")
         self.assertEqual(len(stats), 6)
         for avg, mx in stats:
             self.assertAlmostEqual(avg, 1.0)
             self.assertAlmostEqual(mx, 1.0)
         self.assertLess(dt, g.interval)
+
+    def test_I9_two_week_numeric_correctness(self):
+        # two weeks of 60 s samples (20,160); the buffer keeps the last
+        # week (10,080), so M/h/H/D/W are exact functions of that tail
+        # and L covers the whole life. Data is sparse and deterministic:
+        # a 1-in-7 background pattern under 0.13 plus one spike planted
+        # in each window's exclusive band, and a 2000.0 spike in the
+        # first week that only the lifetime column may see.
+        g = nb.Graph(10, interval=60)
+        n = 2 * nb.WEEK_SECS // 60
+        data = [((i * 7919) % 13) / 100.0 if i % 7 == 0 else 0.0 for i in range(n)]
+        data[10] = 2000.0            # first week: trimmed from the buffer, L only
+        # the windows are nested (M inside h inside H inside D inside W),
+        # so each window's max comes from the largest spike inside it:
+        # spikes grow with the window they are planted in
+        end = n - 1
+        data[end - 2] = 600.0        # in M (5 samples)
+        data[end - 20] = 700.0       # in h (30)
+        data[end - 45] = 800.0       # in H (60)
+        data[end - 500] = 900.0      # in D (1440)
+        data[end - 9000] = 1000.0    # in W (whole buffer) only
+        stored = array.array("f", data)  # what the Graph actually keeps
+        for v in data:
+            g.add(v)
+        self.assertEqual(len(g.samples), nb.WEEK_SECS // 60)  # trimmed to one week
+        # independent one-pass reference over the stored values
+        tail = stored[len(stored) - nb.WEEK_SECS // 60:]
+        ref = []
+        for w in (5, 30, 60, 1440, 10080):  # M/h/H/D/W in samples at 60 s
+            seg = stored[len(stored) - w:]
+            ref.append((sum(seg) / len(seg), max(seg)))
+        ref.append((sum(stored) / len(stored), max(stored)))  # L
+        stats = nb.period_stats(g)
+        self.assertEqual(len(stats), 6)
+        for (avg, mx), (r_avg, r_max) in zip(stats, ref):
+            self.assertAlmostEqual(avg, r_avg, delta=1e-6)
+            self.assertEqual(mx, r_max)  # max is bit-exact
+        # the spike placement above must be what the columns report
+        self.assertEqual([mx for _, mx in stats], [600.0, 700.0, 800.0, 900.0, 1000.0, 2000.0])
 
 
 class TestPricingLoader(Base):

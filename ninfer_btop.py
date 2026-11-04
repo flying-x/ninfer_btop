@@ -688,6 +688,10 @@ DAY_SECS = 86400
 # one week: the raw sample buffer keeps one week, and the W summary
 # window spans the whole kept buffer
 WEEK_SECS = 7 * DAY_SECS
+# samples per block in the Graph period-stat tables: a float64 partial sum
+# and an exact max per block, so a summary window is a few table rows plus
+# at most two partial block edges instead of a rescan of the whole buffer
+BLK_SAMPLES = 1024
 
 
 class Graph:
@@ -706,14 +710,14 @@ class Graph:
 
     `samples` is the raw history, trimmed to the last week (blanks as
     0.0). The M/h/H/D/W summary figures are recomputed from that buffer
-    (the week window spans the whole kept buffer)
-    on every poll (a few milliseconds per graph - the buffer holds at
-    most a week of samples, so the displayed figures are exact functions
-    of the stored samples and cannot drift), and the L column is a
-    separate running total and max over the whole process life. Memory
-    stays bounded (about 5 MB per graph at the default 0.5 s poll) no
-    matter how long the process runs. The figures cover this monitor
-    run, not the engine's life."""
+    on every poll via small block tables partitioning it (a float64
+    partial sum and an exact max per 1024-sample block - a fraction of a
+    millisecond per graph); the figures stay exact functions of the
+    stored samples and cannot drift, and the week window spans the whole
+    kept buffer. The L column is a separate running total and max over
+    the whole process life. Memory stays bounded (about 5 MB per graph at
+    the default 0.5 s poll) no matter how long the process runs. The
+    figures cover this monitor run, not the engine's life."""
 
     # M 5 min, h 30 min, H 1 h, D 1 day, W 1 week (== the kept raw history)
     _PERIOD_SECS = (300, 1800, 3600, DAY_SECS, WEEK_SECS)
@@ -723,6 +727,10 @@ class Graph:
         self.hist = deque(maxlen=width)
         self.samples = array.array("f")  # raw history, trimmed to the last week
         self.hist_cap = int(WEEK_SECS / self.interval)  # one week of samples
+        self.seq = 0  # absolute count of samples ever recorded (block rows key on it)
+        self.blk_s = []  # float64 partial sum per BLK_SAMPLES sample block of `samples`
+        self.blk_m = []  # exact max per block (values as stored, float32)
+        self.blk_first = 0  # absolute block of row 0 (head rows leave with the buffer)
         self.window_ns = tuple(
             max(1, int(secs / self.interval)) for secs in self._PERIOD_SECS
         )  # M/h/H/D/W window sizes in samples (W == the kept history)
@@ -733,21 +741,44 @@ class Graph:
         self.pinned = pinned  # True: scale is the plot's total dot count
 
     def _record(self, v):
-        """Fold one sample (blanks as 0.0) into the raw history and the
-        whole-process L aggregates. The M/h/H/D/W figures are recomputed
-        from the raw history in period_stats, so nothing else to fold."""
+        """Fold one sample (blanks as 0.0) into the raw history, its block
+        table row (O(1)), and the whole-process L aggregates. The M/h/H/D/W
+        figures are recomputed from the block tables in period_stats."""
         self.samples.append(v)
+        self.seq += 1
+        v32 = self.samples[-1]  # the stored value: the tables mirror the buffer
+        b = (self.seq - 1) // BLK_SAMPLES
+        i = b - self.blk_first  # row of that absolute block
+        if i >= len(self.blk_s):
+            self.blk_s.append(v32)
+            self.blk_m.append(v32)
+        else:
+            self.blk_s[i] += v32
+            if v32 > self.blk_m[i]:
+                self.blk_m[i] = v32
         self.life_sum += v
         self.life_count += 1
         if v > self.life_max:
             self.life_max = v
         if len(self.samples) > self.hist_cap:
             del self.samples[:len(self.samples) - self.hist_cap]
+            base = self.seq - self.hist_cap
+            if base > 0 and base % BLK_SAMPLES == 0:
+                # the new buffer start is block-aligned: the head block has
+                # left the buffer; mid-block starts keep their (partial) row
+                del self.blk_s[:1]
+                del self.blk_m[:1]
+                self.blk_first += 1
 
     def adopt_history(self, old):
-        """Take over another graph's raw history and L aggregates
-        (terminal resize); window_ns is identical for the same interval."""
+        """Take over another graph's raw history, block tables, and L
+        aggregates (terminal resize); window_ns is identical for the same
+        interval."""
         self.samples = old.samples
+        self.seq = old.seq
+        self.blk_s = old.blk_s
+        self.blk_m = old.blk_m
+        self.blk_first = old.blk_first
         self.life_sum = old.life_sum
         self.life_count = old.life_count
         self.life_max = old.life_max
@@ -1027,11 +1058,12 @@ def _kv_row(label, val, cap):
 
 # Braille glyph table for the bar graphs, taken from btop (aristocratos/btop,
 # Symbols::graph_symbols["braille_up"] in src/btop_draw.cpp) - btop's default
-# graph symbol. btop packs two samples into one character (older = left dot
-# column, newer = right dot column); we use the table's single-sample
-# diagonal - BRAILLE[level][level] - so each character is a flat column of
-# dots (never a rising/falling glyph) for exactly one sample. Each text row
-# packs four dot rows, so a `rows`-row plot resolves 4*rows vertical levels.
+# graph symbol. As in btop, one character holds two adjacent samples
+# (btop: older = left dot column, newer = right; we mirror it: newer in the
+# left dot column, older in the right), so the full table is used and a
+# character can be any of the 25 glyphs - rising and falling edges render
+# as diagonals instead of flat tops. Each text row packs four dot rows, so
+# a `rows`-row plot resolves 4*rows vertical levels.
 # Index: [left level][right level], levels 0..4 (0 = empty cell).
 BRAILLE = (
     (" ", "⢀", "⢠", "⢰", "⢸"),
@@ -1089,17 +1121,40 @@ def dots_to_chars(dots, rows):
 
 def period_stats(graph):
     """(average, max) for the M/h/H/D/W/L summary columns. M/h/H/D/W are
-    recomputed over the one-week raw history on every poll (a few ms per
-    graph; the week window spans the whole kept buffer) so the figures are
-    exact functions of the stored samples; L
+    recomputed on every poll from the block tables partitioning the
+    one-week raw history (the week window spans the whole kept buffer):
+    each window is full block rows plus at most two raw partial block
+    edges, so the figures are exact functions of the stored samples; L
     is the running total and max over the whole process life. The
     figures cover this monitor run, not the engine's life."""
-    if not len(graph.samples):
+    L = len(graph.samples)
+    if not L:
         return []
+    seq = graph.seq
+    base = seq - L
+    first = graph.blk_first  # rows below it no longer mirror the buffer
     out = []
     for n in graph.window_ns:
-        seg = graph.samples[-n:]  # clamps to the whole buffer if shorter
-        out.append((sum(seg) / len(seg), max(seg)))
+        m = min(n, L)  # clamps to the whole buffer if shorter
+        g0 = seq - m
+        fb = (g0 + BLK_SAMPLES - 1) // BLK_SAMPLES  # first fully-covered block
+        fe = seq // BLK_SAMPLES  # first block the window does not fully cover
+        if fe > fb:
+            ts = float(sum(graph.blk_s[fb - first:fe - first]))
+            mx = float(max(graph.blk_m[fb - first:fe - first]))
+            seg = graph.samples[L - m:fb * BLK_SAMPLES - base]
+            if len(seg):
+                ts += sum(seg)
+                mx = max(mx, max(seg))
+            seg = graph.samples[fe * BLK_SAMPLES - base:L]
+            if len(seg):
+                ts += sum(seg)
+                mx = max(mx, max(seg))
+        else:
+            # the window lies inside at most one block: plain raw scan
+            seg = graph.samples[L - m:]
+            ts, mx = sum(seg), max(seg)
+        out.append((ts / m, mx))
     out.append((graph.life_sum / graph.life_count, graph.life_max))
     return out
 
