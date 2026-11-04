@@ -17,6 +17,12 @@ Polls the engine's Prometheus metrics endpoint and renders:
     per text line; the graphs scroll left to right: the newest sample
     enters at the left edge, and each poll shifts every dot line by
     exactly half a character, so the motion can never jump)
+    - the rightmost 5 braille columns of each graph are period summaries,
+      labeled MhHDL on the baseline row: M last minute, h last half-hour,
+      H last hour, D last day, L this monitor process's life-time. Each
+      column's left dot line is the period average, its right dot line the
+      period max, in the graph's own dot scale (a period max above the
+      current display scale clips at the top)
   * totals: input (prompt) / output (generation) tokens
   * Device KV / Host KV / Cache (checkpoint reuse): three side-by-side
     panels sharing one title row (btop-style). The KV columns show the
@@ -56,6 +62,7 @@ Keys in TUI mode:
 """
 
 import argparse
+import array
 import builtins
 import curses
 import json
@@ -674,35 +681,92 @@ class Graph:
     shifts every dot line by exactly half a character - it can never jump,
     and the buffer holds twice as many samples as the drawn column count.
 
-    `pinned` graphs (the batch graph) map their samples against the plot's
-    total dot count (4*rows, from the panel height): one dot level is
-    always exactly one request, and overload clips at the top of the plot.
-    `floor` is the engine's max_concurrency, which sizes the panel height.
-    Other graphs autoscale to the window max."""
+    The prefill/decode graphs scale against their lifetime peak
+    (dot_scale, the peak= banner token), so the scale is stable for the
+    whole monitor run. `pinned` graphs (the batch graph) map against the
+    plot's total dot count instead: one dot = one request, overload
+    clips at the top. `floor` is the engine's max_concurrency, which
+    sizes the panel height.
 
-    def __init__(self, width, floor=0.0, pinned=False):
+    `samples` is the raw history, trimmed to the last day (blanks as
+    0.0). The M/h/H/D summary figures are recomputed from that buffer
+    on every poll (a few milliseconds per graph - the buffer holds at
+    most a day of samples, so the displayed figures are exact functions
+    of the stored samples and cannot drift), and the L column is a
+    separate running total and max over the whole process life. Memory
+    stays bounded (about 0.7 MB per graph at the default 0.5 s poll) no
+    matter how long the process runs. The figures cover this monitor
+    run, not the engine's life."""
+
+    # M 1 min, h 30 min, H 1 h, D 1 day (== the kept raw history)
+    _PERIOD_SECS = (60, 1800, 3600, 86400)
+
+    def __init__(self, width, floor=0.0, pinned=False, interval=0.5):
+        self.interval = interval if interval and interval > 0 else 0.5
         self.hist = deque(maxlen=width)
+        self.samples = array.array("f")  # raw history, trimmed to the last day
+        self.day_cap = int(86400 / self.interval)  # one day of samples
+        self.window_ns = tuple(
+            max(1, int(secs / self.interval)) for secs in self._PERIOD_SECS
+        )  # M/h/H/D window sizes in samples (D == the kept history)
+        self.life_sum = 0.0   # whole-process running total (L column)
+        self.life_count = 0
+        self.life_max = 0.0   # whole-process max (never shrinks: scalar)
         self.floor = floor  # engine max_concurrency (sizes the batch panel)
         self.pinned = pinned  # True: scale is the plot's total dot count
 
+    def _record(self, v):
+        """Fold one sample (blanks as 0.0) into the raw history and the
+        whole-process L aggregates. The M/h/H/D figures are recomputed
+        from the raw history in period_stats, so nothing else to fold."""
+        self.samples.append(v)
+        self.life_sum += v
+        self.life_count += 1
+        if v > self.life_max:
+            self.life_max = v
+        if len(self.samples) > self.day_cap:
+            del self.samples[:len(self.samples) - self.day_cap]
+
+    def adopt_history(self, old):
+        """Take over another graph's raw history and L aggregates
+        (terminal resize); window_ns is identical for the same interval."""
+        self.samples = old.samples
+        self.life_sum = old.life_sum
+        self.life_count = old.life_count
+        self.life_max = old.life_max
+
     def add(self, v):
-        self.hist.append(None if v is None else max(0.0, float(v)))
+        v = None if v is None else max(0.0, float(v))
+        self.hist.append(v)
+        if v is not None:
+            self._record(v)
 
     def add_blank(self):
         self.hist.append(None)
+        self._record(0.0)
 
     @property
     def values(self):
         return [v for v in self.hist if v is not None]
 
+    def dot_scale(self, rows=1):
+        """Dot scale for a `rows`-char plot: pinned graphs map against the
+        plot's total dot count (one dot = one request, overload clips at
+        the top); the rest map against their lifetime peak (the peak=
+        banner token) so the scale is stable for the whole monitor run,
+        falling back to the window max (None) before any non-zero sample.
+        The M/h/H/D/L summary columns use the same scale as the plot
+        next to them."""
+        if self.pinned:
+            return 4 * rows
+        return self.life_max if self.life_max > 0 else None
+
     def dots(self, rows=1):
         """Dot heights (0..4*rows) for the current window of a `rows`-char
-        plot: pinned graphs scale against the plot's total dot count, the
-        rest autoscale to the window max."""
-        total = 4 * rows
+        plot, scaled by dot_scale (the lifetime peak)."""
         return compute_dots(list(self.hist),
-                            max=total if self.pinned else None,
-                            total_dots=total)
+                            max=self.dot_scale(rows),
+                            total_dots=4 * rows)
 
 
 # ---------------------------------------------------------------- text mode
@@ -778,6 +842,10 @@ def make_colors(scr):
         "bad": (curses.COLOR_RED, -1),
         "batch": (curses.COLOR_GREEN, -1),
         "toks": (curses.COLOR_YELLOW, -1),
+        # dimmed variants (256 palette) for the MhHDL summary columns;
+        # 16-color terminals fail to init the pair and fall back to A_DIM
+        "stat_batch": (22, -1),   # dark green
+        "stat_toks": (100, -1),   # darker yellow
         "label": (curses.COLOR_CYAN, -1),
         "dim": (curses.COLOR_WHITE, -1),
         "bar_dim": (curses.COLOR_BLACK, -1),
@@ -800,12 +868,14 @@ def cstr(scr, c, key, s):
 
 
 def metric_stat_segments(graph, cur_str):
-    """Banner suffix for a graph panel title: (cur=..,max=..,avg=..,min=..).
+    """Banner suffix for a graph panel title:
+    (cur=..,max=..,peak=..,avg=..,min=..).
 
     Returns a list of (text, is_peak) segments, empty when there are no
     samples yet. The max= token is flagged is_peak so draw_panel paints it in
-    the highlighted peak color. min/avg/max cover the whole plotted window;
-    cur is the latest sample, passed in as cur_str.
+    the highlighted peak color; peak= is the lifetime max (which also sets
+    the graph's scale) and stays plain. min/avg/max cover the whole plotted
+    window; cur is the latest sample, passed in as cur_str.
     """
     vals = graph.values
     if not vals:
@@ -815,6 +885,7 @@ def metric_stat_segments(graph, cur_str):
     return [
         (f"(cur={cur_str}", False),
         (f",max={mx:,.0f}", True),
+        (f",peak={graph.life_max:,.0f}", False),
         (f",avg={av:,.0f}", False),
         (f",min={mn:,.0f}", False),
         (")", False),
@@ -950,9 +1021,11 @@ BRAILLE = (
 def compute_dots(samples, max=None, total_dots=4):
     """Dot heights (0..total_dots) for the samples of a bar graph.
 
-    `max` is the value that fills the plot: the plot's total dot count for
-    pinned graphs (the batch graph - one dot = one request), or None to
-    autoscale to the window max (prefill/decode, spill/recall).
+    `max` is the value that fills the plot: the graphs pass their scale
+    from Graph.dot_scale (pinned graphs the plot's total dot count, the
+    rest the lifetime peak with a window-max fallback before traffic),
+    or None to autoscale to the window max (the spill/recall transfer
+    rows).
     no_dots = ceil(v / (max / total_dots)): every non-zero sample draws at
     least one dot, and overshoots clip at total_dots."""
     if max is None:  # the parameter shadows the builtin max
@@ -990,15 +1063,32 @@ def dots_to_chars(dots, rows):
     return grid
 
 
+def period_stats(graph):
+    """(average, max) for the M/h/H/D/L summary columns. M/h/H/D are
+    recomputed over the one-day raw history on every poll (a few ms per
+    graph) so the figures are exact functions of the stored samples; L
+    is the running total and max over the whole process life. The
+    figures cover this monitor run, not the engine's life."""
+    if not len(graph.samples):
+        return []
+    out = []
+    for n in graph.window_ns:
+        seg = graph.samples[-n:]  # clamps to the whole buffer if shorter
+        out.append((sum(seg) / len(seg), max(seg)))
+    out.append((graph.life_sum / graph.life_count, graph.life_max))
+    return out
+
+
 def draw_bar_graph(scr, y, graph: Graph, rows, width, key, c):
     hist_vals = list(graph.hist)
     dots = graph.dots(rows)  # one dot height per sample
     # two samples per braille character: the plot is half the buffer wide;
     # the buffer holds oldest -> newest, but the newest sample is on the
     # left, so the window is read newest first
-    n = min(len(hist_vals), 2 * (width - 1))
+    # the rightmost 5 columns are reserved for the MhHDL period summaries
+    n = min(len(hist_vals), 2 * (width - 5))
     grid = dots_to_chars(dots[-n:][::-1], rows)
-    plot_w = min(width - 1, (n + 1) // 2)
+    plot_w = min(width - 5, (n + 1) // 2)
     base_attr = curses.color_pair(c.get(key, 0))
     # the newest sample is on the left: the leftmost character holds it and
     # the second-newest sample, and the graph scrolls left to right (bars
@@ -1015,11 +1105,37 @@ def draw_bar_graph(scr, y, graph: Graph, rows, width, key, c):
                 scr.addstr(y + r, 1 + col, ch, base_attr)
             except curses.error:
                 pass
-    # baseline
+    # rightmost 5 columns: M/h/H/D/L summaries (left dot line = avg, right
+    # = max), grayed out against the moving bars (darker color pair on
+    # 256-color terminals, A_DIM fallback otherwise), in the plot's dot
+    # scale
+    stats = period_stats(graph)
+    stat_key = "stat_" + key
+    stat_attr = curses.color_pair(c[stat_key]) if stat_key in c \
+        else base_attr | curses.A_DIM
+    if stats:
+        for col, (avg, mx) in enumerate(stats):
+            g5 = dots_to_chars(compute_dots([avg, mx],
+                                            max=graph.dot_scale(rows),
+                                            total_dots=4 * rows), rows)
+            for r in range(rows):
+                ch = g5[r][0]
+                if ch == " ":
+                    continue
+                try:
+                    scr.addstr(y + r, width - 4 + col, ch, stat_attr)
+                except curses.error:
+                    pass
+    # baseline; the period labels sit under their summary columns
     try:
-        scr.addnstr(y + rows, 1, "─" * plot_w, plot_w)
+        scr.addnstr(y + rows, 1, "─" * (width - 5), width - 5)
     except curses.error:
         pass
+    if stats:
+        try:
+            scr.addnstr(y + rows, width - 4, "MhHDL", 5, stat_attr)
+        except curses.error:
+            pass
     # the cur/min/max/avg figures live in the panel title banner now
     return y + rows + 1
 
@@ -1281,13 +1397,18 @@ def main_loop(stdscr, args):
 
     max_y, max_x = stdscr.getmaxyx()
     gwidth = max(20, max_x - 1)  # drawn columns (x=1 .. max_x-1)
-    # two samples per drawn character: histories are twice the column count
-    graphs = {"batch": Graph(2 * gwidth, pinned=True),  # pinned: scale = plot's dot count (1 dot = 1 request)
-              "toks": Graph(2 * gwidth), "prefill": Graph(2 * gwidth),
+    interval = args.interval / 1000.0
+    # two samples per drawn character: the buffer holds exactly what the
+    # scroll region draws (width-5 chars = 2*(width-5) samples) - the
+    # rightmost 5 columns are the MhHDL summaries, so a wider buffer would
+    # hide scroll data under them and the banner max/avg/min (computed over
+    # the buffer) would lag the visible plot
+    graphs = {"batch": Graph(2 * (gwidth - 5), pinned=True, interval=interval),  # pinned: 1 dot = 1 request, always
+              "toks": Graph(2 * (gwidth - 5), interval=interval),
+              "prefill": Graph(2 * (gwidth - 5), interval=interval),
               # transfer graphs: fixed 13-char width (26 samples ~ 13 s
               # at the default 500 ms poll), independent of terminal width
               "xfer_d2h": Graph(26), "xfer_h2d": Graph(26)}
-    interval = args.interval / 1000.0
     eng = Engine(args.url, interval, args.pricing_rates, label=args.pricing_model)
     last_poll = 0.0
     running = True
@@ -1321,8 +1442,10 @@ def main_loop(stdscr, args):
             gwidth = max(20, nx - 1)
             for k in ("batch", "toks", "prefill"):  # xfer graphs stay 13 chars
                 old = list(graphs[k].hist)
-                g2 = Graph(2 * gwidth, floor=graphs[k].floor, pinned=graphs[k].pinned)
+                g2 = Graph(2 * (gwidth - 5), floor=graphs[k].floor, pinned=graphs[k].pinned,
+                           interval=graphs[k].interval)
                 g2.hist.extend(old[-2 * gwidth:])
+                g2.adopt_history(graphs[k])  # raw history + L aggregates
                 graphs[k] = g2
             frame(stdscr, eng, graphs, c)
 

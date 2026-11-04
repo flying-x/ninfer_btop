@@ -312,7 +312,8 @@ class TestMetricStatBanner(Base):
         for v in (2, 8, 4, 6, 0):
             g.add(v)
         segs = nb.metric_stat_segments(g, "4")
-        self.assertEqual("".join(t for t, _ in segs), "(cur=4,max=8,avg=4,min=0)")
+        self.assertEqual("".join(t for t, _ in segs),
+                           "(cur=4,max=8,peak=8,avg=4,min=0)")
         flags = [flag for _, flag in segs]
         self.assertEqual(flags.count(True), 1)  # only the max token is highlighted
         self.assertTrue(next(t for t, flag in segs if flag).startswith(",max="))
@@ -329,12 +330,14 @@ class TestMetricStatBanner(Base):
                       stats=nb.metric_stat_segments(g, "4"))
         row = [w for w in scr.writes if w[0] == 0]
         joined = "".join(w[2] for w in row)
-        for token in ("cur=4", "max=8", "avg=", "min="):
+        for token in ("cur=4", "max=8", "peak=8", "avg=", "min="):
             self.assertIn(token, joined)
         # the max= token is painted with the peak attribute (A_REVERSE under the
         # colorless stub); the rest use the default attribute
         peak_attr = nb.curses.A_REVERSE
         self.assertTrue(any(w[2].startswith(",max=") and w[3] == peak_attr for w in row))
+        # the peak= token exists but stays plain, like the other stats
+        self.assertTrue(any(w[2].startswith(",peak=") and w[3] == 0 for w in row))
         self.assertTrue(any(w[2].startswith("(cur=") and w[3] == 0 for w in row))
         # the max token is never drawn in a plain (non-peak) attribute
         self.assertFalse(any(w[2].startswith(",max=") and w[3] != peak_attr for w in row))
@@ -348,7 +351,10 @@ class TestMetricStatBanner(Base):
         # (0 under the colorless stub; a highlighted char would be A_REVERSE)
         scr = FakeScreen(40, 120)
         nb.draw_bar_graph(scr, 0, g, 2, 50, "toks", {})
-        glyphs = [w for w in scr.writes if not w[2].startswith("─")]
+        # the moving bars (x <= width-5) are painted in the base color; the
+        # MhHDL summary columns on the right are intentionally dimmed
+        glyphs = [w for w in scr.writes
+                  if w[1] <= 45 and not w[2].startswith("─")]
         self.assertTrue(glyphs)
         self.assertTrue(all(w[3] == 0 for w in glyphs))
 
@@ -711,8 +717,131 @@ class TestBatchHeight(Base):
         self.assertEqual(nb.compute_dots([0.1, 1.0]), [1, 4])
         self.assertEqual(nb.compute_dots([None, 0.0, 2.0]), [0, 0, 4])
 
+    def test_J5_dots_scale_to_lifetime_peak(self):
+        # the scale is the lifetime peak (the peak= banner token), not the
+        # window max: after the peak sample scrolls out of the window the
+        # bars stay proportionally small
+        g = nb.Graph(4)
+        g.add(8.0)
+        for _ in range(4):
+            g.add(1.0)
+        self.assertEqual(g.dots(1), [1, 1, 1, 1])  # peak 8 -> 1/4 height
+        # pinned graphs ignore the lifetime peak: 1 dot = 1 request, always
+        gp = nb.Graph(10, pinned=True)
+        gp.add(5.0)
+        for _ in range(4):
+            gp.add(1.0)
+        self.assertEqual(gp.dots(2), [5, 1, 1, 1, 1])  # 1 dot = 1 request
+        # before any non-zero sample plain graphs autoscale to the window max
+        g1 = nb.Graph(4)
+        g1.add_blank()
+        self.assertIsNone(g1.dot_scale(1))
+
 
 # ------------------------------------- I. pricing loader + row selection
+
+class TestPeriodColumns(Base):
+    """I: M/h/H/D/L period summary columns (avg left, max right)."""
+
+    def test_I1_period_stats_windows(self):
+        # 2 min of 0.5 s samples: first minute 2.0, second minute 10.0
+        g = nb.Graph(50)
+        for _ in range(120):
+            g.add(2.0)
+        for _ in range(120):
+            g.add(10.0)
+        stats = nb.period_stats(g)
+        self.assertEqual(len(stats), 5)
+        m_avg, m_max = stats[0]
+        self.assertAlmostEqual(m_avg, 10.0)
+        self.assertAlmostEqual(m_max, 10.0)
+        # h/H/D/L all clamp to the whole 2-minute buffer
+        for avg, mx in stats[1:]:
+            self.assertAlmostEqual(avg, 6.0)
+            self.assertAlmostEqual(mx, 10.0)
+
+    def test_I2_short_history_clamps(self):
+        g = nb.Graph(10)
+        for _ in range(10):
+            g.add(4.0)
+        stats = nb.period_stats(g)
+        self.assertEqual(len(stats), 5)
+        for avg, mx in stats:
+            self.assertAlmostEqual(avg, 4.0)
+            self.assertAlmostEqual(mx, 4.0)
+
+    def test_I3_labels_and_dim_summary(self):
+        g = nb.Graph(20)
+        for _ in range(30):
+            g.add(5.0)
+        scr = FakeScreen(40, 32)
+        nb.draw_bar_graph(scr, 0, g, 1, 30, "toks", {})
+        # the MhHDL labels sit on the baseline row under the summary columns
+        lab = [w for w in scr.writes if w[2] == "MhHDL"]
+        self.assertEqual(lab[0][:3], (1, 26, "MhHDL"))
+        self.assertEqual(lab[0][3], nb.curses.A_DIM)
+        # all-5.0 samples: avg = max = full scale, so every summary column
+        # is a full character, dimmed; five columns at x = width-4 .. width
+        cols = sorted(x for (y, x, t, a) in scr.writes
+                      if y == 0 and x >= 26 and a == nb.curses.A_DIM)
+        self.assertEqual(cols, [26, 27, 28, 29, 30])
+        base = [w for w in scr.writes
+                if w[0] == 1 and w[1] == 1 and w[2].startswith("─")]
+        self.assertEqual(len(base[0][2]), 25)  # width-5, labels take 5
+
+    def test_I4_max_leaves_window(self):
+        # M window = 120 samples at the 0.5 s default: the spike at
+        # sample 0 must drop out of M's max once 120 newer samples
+        # arrive, while L (whole life-time) still sees it
+        g = nb.Graph(10)
+        g.add(100.0)
+        for _ in range(119):
+            g.add(1.0)
+        _, m_max = nb.period_stats(g)[0]
+        self.assertAlmostEqual(m_max, 100.0)
+        g.add(1.0)  # 121st sample: the spike slides out of the window
+        _, m_max = nb.period_stats(g)[0]
+        self.assertAlmostEqual(m_max, 1.0)
+        _, l_max = nb.period_stats(g)[4]
+        self.assertAlmostEqual(l_max, 100.0)
+
+    def test_I6_all_zero_window_has_no_float_residue(self):
+        # the running sum's float residue must not light a phantom avg dot
+        # in an all-zero window: burst, wait it out, avg and max are both 0
+        g = nb.Graph(240, interval=0.5)
+        for _ in range(50):
+            g.add(0.0)
+        for _ in range(10):
+            g.add(123.4567)
+        for _ in range(200):  # the M window (120 samples) goes all zero
+            g.add(0.0)
+        avg, mx = nb.period_stats(g)[0]
+        self.assertEqual(mx, 0.0)
+        self.assertEqual(avg, 0.0)
+        # and a new spike after the quiet stretch reports cleanly
+        g.add(500.0)
+        avg, mx = nb.period_stats(g)[0]
+        self.assertEqual(mx, 500.0)
+        self.assertGreater(avg, 0.0)
+
+    def test_I5_one_day_buffer_and_lifetime_totals(self):
+        # interval 60 s: the raw history is trimmed to the last day
+        # (1440 samples); after 1500 samples the spike at sample 0 is
+        # gone from the history and from D, but the L column's running
+        # total and max still cover the whole process life
+        g = nb.Graph(10, interval=60)
+        g.add(1000.0)
+        for _ in range(1499):
+            g.add(1.0)
+        self.assertEqual(len(g.samples), 1440)
+        stats = nb.period_stats(g)
+        _, d_max = stats[3]
+        self.assertAlmostEqual(d_max, 1.0)
+        l_avg, l_max = stats[4]
+        self.assertEqual(g.life_count, 1500)
+        self.assertAlmostEqual(l_avg, (1000.0 + 1499 * 1.0) / 1500)
+        self.assertAlmostEqual(l_max, 1000.0)
+
 
 class TestPricingLoader(Base):
     """The hand-rolled pricing.yaml loader, key selection, and the error path."""

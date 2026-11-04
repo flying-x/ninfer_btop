@@ -22,8 +22,18 @@ Polls the engine's Prometheus `/metrics` endpoint and renders:
   the left dot column, so a character may be a rising/falling glyph. Each poll
   appends one sample and shifts every dot line by exactly half a character (one full
   character per two polls) — the motion can never jump. Each sample maps to an
-  integer dot height (rounded up, so any non-zero sample draws at least one dot);
-  the prefill/decode graphs autoscale to their own window peak.
+  integer dot height (rounded up, so any non-zero sample draws at least one dot).
+  The banner also shows `peak=` - the lifetime max, which the prefill/decode
+  graphs scale to, so their bars stay proportional for the whole monitor run
+  (the batch graph stays pinned: one dot = one running request; before the
+  first non-zero sample the prefill/decode graphs autoscale to the window
+  peak, and the spill/recall rows keep window autoscaling).
+  The rightmost 5 braille columns of each graph summarize trailing windows —
+  `M` last minute, `h` last half-hour, `H` last hour, `D` last day, `L` this
+  monitor run's life-time — labeled `MhHDL` on the baseline row in place of the
+  dashes, and drawn dimmed (grayed out against the moving bars). Each column's left dot
+  line is the window average, its right dot line the window max, in the graph's
+  own dot scale; `L` covers this process's life, not the engine's.
 - token totals: input (prompt) / output (generation)
 - Device KV ∥ Host KV ∥ Cache (checkpoint reuse) — three panels side by side
   on one shared title row plus 4 content rows (btop-style). The two KV

@@ -14,6 +14,9 @@ Expect:
   * each braille character holds two adjacent samples (the newer in the
     left dot line) - one single dot line per sample - so the slope is
     drawn with rising/falling glyphs: four dot levels per text row
+  * the rightmost 5 columns (labeled MhHDL on the baseline row) are the
+    period summaries - here the buffer is short, so all five windows
+    clamp to the whole staircase and show identical avg/max columns
 
 Run:   python3 bar_graph_test.py            (real terminal; any key quits)
        python3 bar_graph_test.py --text     (plain stdout preview, piped)
