@@ -890,7 +890,8 @@ class TestPeriodColumns(Base):
         # week (10,080), so M/h/H/D/W are exact functions of that tail
         # and L covers the whole life. Data is sparse and deterministic:
         # a 1-in-7 background pattern under 0.13 plus one spike planted
-        # in each window's exclusive band, and a 2000.0 spike in the
+        # in each window's exclusive band (plus one in W's left-edge
+        # partial block, to pin its edge-max), and a 2000.0 spike in the
         # first week that only the lifetime column may see.
         g = nb.Graph(10, interval=60)
         n = 2 * nb.WEEK_SECS // 60
@@ -905,12 +906,12 @@ class TestPeriodColumns(Base):
         data[end - 45] = 800.0       # in H (60)
         data[end - 500] = 900.0      # in D (1440)
         data[end - 9000] = 1000.0    # in W (whole buffer) only
+        data[10150] = 1100.0         # in W's left-edge partial block only
         stored = array.array("f", data)  # what the Graph actually keeps
         for v in data:
             g.add(v)
         self.assertEqual(len(g.samples), nb.WEEK_SECS // 60)  # trimmed to one week
         # independent one-pass reference over the stored values
-        tail = stored[len(stored) - nb.WEEK_SECS // 60:]
         ref = []
         for w in (5, 30, 60, 1440, 10080):  # M/h/H/D/W in samples at 60 s
             seg = stored[len(stored) - w:]
@@ -922,7 +923,7 @@ class TestPeriodColumns(Base):
             self.assertAlmostEqual(avg, r_avg, delta=1e-6)
             self.assertEqual(mx, r_max)  # max is bit-exact
         # the spike placement above must be what the columns report
-        self.assertEqual([mx for _, mx in stats], [600.0, 700.0, 800.0, 900.0, 1000.0, 2000.0])
+        self.assertEqual([mx for _, mx in stats], [600.0, 700.0, 800.0, 900.0, 1100.0, 2000.0])
 
 
 class TestPricingLoader(Base):
