@@ -16,6 +16,7 @@ import textwrap
 import time
 import unittest
 
+import bar_graphs as bg
 import frame_chrome as fc
 import ninfer_btop as nb
 
@@ -234,7 +235,7 @@ class TestFrameDownState(Base):
     def frame(self, calib, ok):
         nb.CALIB = calib
         scr = FakeScreen(40, 120)
-        graphs = {k: nb.Graph(60) for k in ("batch", "toks", "prefill")}
+        graphs = {k: bg.Graph(60) for k in ("batch", "toks", "prefill")}
         fc.frame(scr, make_engine(ok), graphs, {}, calib)
         return scr
 
@@ -310,7 +311,7 @@ class TestPureFunctions(Base):
 
 class TestMetricStatBanner(Base):
     def test_F1_segments_order_and_peak_flag(self):
-        g = nb.Graph(10)
+        g = bg.Graph(10)
         for v in (2, 8, 4, 6, 0):
             g.add(v)
         segs = fc.metric_stat_segments(g, "4")
@@ -321,10 +322,10 @@ class TestMetricStatBanner(Base):
         self.assertTrue(next(t for t, flag in segs if flag).startswith(",max="))
 
     def test_F2_empty_window_has_no_banner_suffix(self):
-        self.assertEqual(fc.metric_stat_segments(nb.Graph(10), "—"), [])
+        self.assertEqual(fc.metric_stat_segments(bg.Graph(10), "—"), [])
 
     def test_F3_draw_panel_paints_max_in_peak_color(self):
-        g = nb.Graph(10)
+        g = bg.Graph(10)
         for v in (2, 8, 4):
             g.add(v)
         scr = FakeScreen(40, 120)
@@ -345,7 +346,7 @@ class TestMetricStatBanner(Base):
         self.assertFalse(any(w[2].startswith(",max=") and w[3] != peak_attr for w in row))
 
     def test_F4_graphs_paint_no_peak_highlight(self):
-        g = nb.Graph(10)
+        g = bg.Graph(10)
         for v in (2, 8, 4, 6, 0):
             g.add(v)
         # the bar graph itself has no peak highlight: every glyph - the
@@ -399,7 +400,7 @@ class TestCacheHealth(Base):
         eng.m = {"ninfer_engine_ready": 1.0}
         eng.last_frame = s
         eng.start_time = None
-        graphs = {k: nb.Graph(60) for k in ("batch", "toks", "prefill")}
+        graphs = {k: bg.Graph(60) for k in ("batch", "toks", "prefill")}
         scr = FakeScreen(40, 120)
         fc.frame(scr, eng, graphs, c)
         self.assertTrue(rows_with(scr, "Device KV"))
@@ -446,7 +447,7 @@ class TestCacheHealth(Base):
         eng = make_engine(True)
         eng.m = {"ninfer_engine_ready": 1.0}
         eng.last_frame = s
-        graphs = {k: nb.Graph(60) for k in ("batch", "toks", "prefill")}
+        graphs = {k: bg.Graph(60) for k in ("batch", "toks", "prefill")}
         scr = FakeScreen(40, 120)
         fc.frame(scr, eng, graphs, c)
         joined = "".join(t for (_, _, t, _) in scr.writes)
@@ -469,7 +470,7 @@ class TestCacheHealth(Base):
         eng = make_engine(True)
         eng.m = {"ninfer_engine_ready": 1.0}
         eng.last_frame = self._sample()
-        graphs = {k: nb.Graph(60) for k in ("batch", "toks", "prefill")}
+        graphs = {k: bg.Graph(60) for k in ("batch", "toks", "prefill")}
         scr = FakeScreen(40, 120)
         fc.frame(scr, eng, graphs, c)
         self.assertFalse(rows_with(scr, "(device)"))
@@ -481,7 +482,7 @@ class TestCacheHealth(Base):
              "batch": 7, "label": 8, "val": 9, "peak": 10}
         eng = make_engine(True)
         eng.m = {"ninfer_engine_ready": 1.0}
-        graphs = {k: nb.Graph(60) for k in ("batch", "toks", "prefill")}
+        graphs = {k: bg.Graph(60) for k in ("batch", "toks", "prefill")}
         # paused = 2 -> the "paused 2" segment carries the 'bad' (red) pair
         eng.last_frame = self._sample(paused=2)
         scr = FakeScreen(40, 120)
@@ -506,7 +507,7 @@ class TestCacheHealth(Base):
         eng.m = {"ninfer_engine_ready": 1.0}
         eng.last_frame = self._sample(ctx_window=131072)
         eng.start_time = None
-        graphs = {k: nb.Graph(60) for k in ("batch", "toks", "prefill")}
+        graphs = {k: bg.Graph(60) for k in ("batch", "toks", "prefill")}
         scr = FakeScreen(40, 120)
         fc.frame(scr, eng, graphs, c, nb.CALIB)
         row1 = "".join(t for (y, x, t, a) in scr.writes if y == 1)
@@ -522,7 +523,7 @@ class TestCacheHealth(Base):
         eng.m = {"ninfer_engine_ready": 1.0}
         eng.last_frame = self._sample()  # no ctx_window key
         eng.start_time = None
-        graphs = {k: nb.Graph(60) for k in ("batch", "toks", "prefill")}
+        graphs = {k: bg.Graph(60) for k in ("batch", "toks", "prefill")}
         scr = FakeScreen(40, 120)
         fc.frame(scr, eng, graphs, c, nb.CALIB)
         row1 = "".join(t for (y, x, t, a) in scr.writes if y == 1)
@@ -535,7 +536,7 @@ class TestCacheHealth(Base):
         eng.m = {"ninfer_engine_ready": 1.0}
         eng.last_frame = self._sample(ctx_window=131072)
         eng.start_time = None
-        graphs = {k: nb.Graph(60) for k in ("batch", "toks", "prefill")}
+        graphs = {k: bg.Graph(60) for k in ("batch", "toks", "prefill")}
         scr = FakeScreen(40, 120)
         fc.frame(scr, eng, graphs, {})
         row1 = "".join(t for (y, x, t, a) in scr.writes if y == 1)
@@ -612,13 +613,13 @@ class TestXferSpillRecall(Base):
         eng.m = {"ninfer_engine_ready": 1.0}
         eng.last_frame = s
         eng.start_time = None
-        d2h = nb.Graph(26)
+        d2h = bg.Graph(26)
         for v in [0.0] * 10 + [200.0] * 4 + [0.0] * 12:
             d2h.add(v)
-        h2d = nb.Graph(26)
+        h2d = bg.Graph(26)
         for v in [0.0] * 24 + [30.0, 30.0]:
             h2d.add(v)
-        graphs = {k: nb.Graph(60) for k in ("batch", "toks", "prefill")}
+        graphs = {k: bg.Graph(60) for k in ("batch", "toks", "prefill")}
         graphs["xfer_d2h"] = d2h
         graphs["xfer_h2d"] = h2d
         scr = FakeScreen(40, 120)
@@ -639,13 +640,13 @@ class TestXferSpillRecall(Base):
 
     def test_H4_xfer_graph_autoscale_and_empty(self):
         # all-zero window: blank graph, 0B/s label
-        g = nb.Graph(26)
+        g = bg.Graph(26)
         for _ in range(26):
             g.add(0.0)
         self.assertEqual(nb._xfer_row("  X  ", g),
                          "  X  " + " " * 13 + " " + "0B/s")
         # a burst autoscales against its own window peak, not a shared one
-        g2 = nb.Graph(26)
+        g2 = bg.Graph(26)
         for v in [0.0] * 11 + [5.0] * 4 + [0.0] * 11:
             g2.add(v)
         row = nb._xfer_row("  X  ", g2)
@@ -669,8 +670,8 @@ class TestBatchHeight(Base):
         scr = FakeScreen(max_y, 120)
         eng = make_engine(True)
         eng.last_frame = self._sample()
-        graphs = {"batch": nb.Graph(60, floor=floor),
-                  "toks": nb.Graph(60), "prefill": nb.Graph(60)}
+        graphs = {"batch": bg.Graph(60, floor=floor),
+                  "toks": bg.Graph(60), "prefill": bg.Graph(60)}
         fc.frame(scr, eng, graphs, {}, calib)
         b = min(rows_with(scr, "Batch size"))
         p = min(rows_with(scr, "Prefill t/s"))
@@ -688,9 +689,9 @@ class TestBatchHeight(Base):
         self.assertEqual(self._panel_height(8, CALIB_OK), 2)
 
     def test_J3_floor_preserved_on_resize_rebuild(self):
-        g = nb.Graph(60, floor=8)
+        g = bg.Graph(60, floor=8)
         g.add(3.0)
-        g2 = nb.Graph(40, floor=g.floor, pinned=g.pinned)
+        g2 = bg.Graph(40, floor=g.floor, pinned=g.pinned)
         g2.hist.extend(list(g.hist)[-40:])
         self.assertEqual(g2.floor, 8.0)
         self.assertEqual(list(g2.hist), list(g.hist)[-40:])
@@ -698,44 +699,44 @@ class TestBatchHeight(Base):
     def test_J4_dots_pinned_to_plot_height(self):
         # pinned: max = the plot's total dot count (4*rows) - 1 dot = 1
         # request, a burst above the cap clips at the top
-        self.assertEqual(nb.compute_dots([1.0, 2.0, 8.0], max=8, total_dots=8), [1, 2, 8])
-        self.assertEqual(nb.compute_dots([1.0, 2.0, 11.0], max=8, total_dots=8), [1, 2, 8])
-        g = nb.Graph(10, floor=4, pinned=True)
+        self.assertEqual(bg.compute_dots([1.0, 2.0, 8.0], max=8, total_dots=8), [1, 2, 8])
+        self.assertEqual(bg.compute_dots([1.0, 2.0, 11.0], max=8, total_dots=8), [1, 2, 8])
+        g = bg.Graph(10, floor=4, pinned=True)
         for v in (1.0, 2.0, 8.0):
             g.add(v)
         self.assertEqual(g.dots(2), [1, 2, 8])
         # plain graphs autoscale to the window max
-        g0 = nb.Graph(10)
+        g0 = bg.Graph(10)
         g0.add(1.0)
         g0.add(3.0)
         self.assertEqual(g0.dots(1), [2, 4])
         # floor no longer touches the scale of plain graphs (it only sizes
         # the batch panel); autoscale still takes the window max
-        gp2 = nb.Graph(10, floor=4)
+        gp2 = bg.Graph(10, floor=4)
         gp2.add(1.0)
         gp2.add(3.0)
         self.assertEqual(gp2.dots(1), [2, 4])
         # ceil: any non-zero sample draws at least one dot; Nones stay blank
-        self.assertEqual(nb.compute_dots([0.1, 1.0]), [1, 4])
-        self.assertEqual(nb.compute_dots([None, 0.0, 2.0]), [0, 0, 4])
+        self.assertEqual(bg.compute_dots([0.1, 1.0]), [1, 4])
+        self.assertEqual(bg.compute_dots([None, 0.0, 2.0]), [0, 0, 4])
 
     def test_J5_dots_scale_to_lifetime_peak(self):
         # the scale is the lifetime peak (the peak= banner token), not the
         # window max: after the peak sample scrolls out of the window the
         # bars stay proportionally small
-        g = nb.Graph(4)
+        g = bg.Graph(4)
         g.add(8.0)
         for _ in range(4):
             g.add(1.0)
         self.assertEqual(g.dots(1), [1, 1, 1, 1])  # peak 8 -> 1/4 height
         # pinned graphs ignore the lifetime peak: 1 dot = 1 request, always
-        gp = nb.Graph(10, pinned=True)
+        gp = bg.Graph(10, pinned=True)
         gp.add(5.0)
         for _ in range(4):
             gp.add(1.0)
         self.assertEqual(gp.dots(2), [5, 1, 1, 1, 1])  # 1 dot = 1 request
         # before any non-zero sample plain graphs autoscale to the window max
-        g1 = nb.Graph(4)
+        g1 = bg.Graph(4)
         g1.add_blank()
         self.assertIsNone(g1.dot_scale(1))
 
@@ -749,12 +750,12 @@ class TestPeriodColumns(Base):
         # 10 min of 0.5 s samples: first 5 min 2.0, second 5 min 10.0 -
         # the M (5 min) window sees exactly the second half; h/H/D/W/L all
         # clamp to the whole 10-minute buffer
-        g = nb.Graph(50)
+        g = bg.Graph(50)
         for _ in range(600):
             g.add(2.0)
         for _ in range(600):
             g.add(10.0)
-        stats = nb.period_stats(g)
+        stats = bg.period_stats(g)
         self.assertEqual(len(stats), 6)
         m_avg, m_max = stats[0]
         self.assertAlmostEqual(m_avg, 10.0)
@@ -764,17 +765,17 @@ class TestPeriodColumns(Base):
             self.assertAlmostEqual(mx, 10.0)
 
     def test_I2_short_history_clamps(self):
-        g = nb.Graph(10)
+        g = bg.Graph(10)
         for _ in range(10):
             g.add(4.0)
-        stats = nb.period_stats(g)
+        stats = bg.period_stats(g)
         self.assertEqual(len(stats), 6)
         for avg, mx in stats:
             self.assertAlmostEqual(avg, 4.0)
             self.assertAlmostEqual(mx, 4.0)
 
     def test_I3_labels_and_dim_summary(self):
-        g = nb.Graph(20)
+        g = bg.Graph(20)
         for _ in range(30):
             g.add(5.0)
         scr = FakeScreen(40, 32)
@@ -796,41 +797,41 @@ class TestPeriodColumns(Base):
         # M window = 600 samples (5 min) at the 0.5 s default: the spike at
         # sample 0 must drop out of M's max once 600 newer samples
         # arrive, while L (whole life-time) still sees it
-        g = nb.Graph(10)
+        g = bg.Graph(10)
         g.add(100.0)
         for _ in range(599):
             g.add(1.0)
-        _, m_max = nb.period_stats(g)[0]
+        _, m_max = bg.period_stats(g)[0]
         self.assertAlmostEqual(m_max, 100.0)
         g.add(1.0)  # 601st sample: the spike slides out of the window
-        _, m_max = nb.period_stats(g)[0]
+        _, m_max = bg.period_stats(g)[0]
         self.assertAlmostEqual(m_max, 1.0)
-        _, l_max = nb.period_stats(g)[5]
+        _, l_max = bg.period_stats(g)[5]
         self.assertAlmostEqual(l_max, 100.0)
 
     def test_I6_all_zero_window_has_no_float_residue(self):
         # the running sum's float residue must not light a phantom avg dot
         # in an all-zero window: burst, wait it out, avg and max are both 0
-        g = nb.Graph(240, interval=0.5)
+        g = bg.Graph(240, interval=0.5)
         for _ in range(50):
             g.add(0.0)
         for _ in range(10):
             g.add(123.4567)
         for _ in range(610):  # the M window (600 samples) goes all zero
             g.add(0.0)
-        avg, mx = nb.period_stats(g)[0]
+        avg, mx = bg.period_stats(g)[0]
         self.assertEqual(mx, 0.0)
         self.assertEqual(avg, 0.0)
         # and a new spike after the quiet stretch reports cleanly
         g.add(500.0)
-        avg, mx = nb.period_stats(g)[0]
+        avg, mx = bg.period_stats(g)[0]
         self.assertEqual(mx, 500.0)
         self.assertGreater(avg, 0.0)
 
     def test_I7_baseline_time_span_label(self):
         # the baseline carries a centered label of the time span the plot
         # region covers: 2 samples per character * interval
-        g = nb.Graph(20)
+        g = bg.Graph(20)
         for _ in range(30):
             g.add(1.0)
         scr = FakeScreen(40, 32)
@@ -847,12 +848,12 @@ class TestPeriodColumns(Base):
         # (10080 samples); after 10200 samples the spike at sample 0 is
         # gone from the history and from D/W, but the L column's running
         # total and max still cover the whole process life
-        g = nb.Graph(10, interval=60)
+        g = bg.Graph(10, interval=60)
         g.add(1000.0)
         for _ in range(10199):
             g.add(1.0)
         self.assertEqual(len(g.samples), 10080)
-        stats = nb.period_stats(g)
+        stats = bg.period_stats(g)
         _, d_max = stats[3]
         self.assertAlmostEqual(d_max, 1.0)
         _, w_max = stats[4]  # the week window == the kept buffer
@@ -869,13 +870,13 @@ class TestPeriodColumns(Base):
         # must stay inside one polling interval, or the UI would stutter
         # (measured on box hermes: about 26 ms per graph, about 126 ms for
         # all five graphs per tick)
-        g = nb.Graph(10)
-        n = int(nb.WEEK_SECS / g.interval)
+        g = bg.Graph(10)
+        n = int(bg.WEEK_SECS / g.interval)
         for _ in range(n):
             g.add(1.0)
         self.assertEqual(len(g.samples), n)  # the buffer holds exactly one week
         t0 = time.perf_counter()
-        stats = nb.period_stats(g)
+        stats = bg.period_stats(g)
         dt = time.perf_counter() - t0
         print(f"I8 full-week refresh: {len(g.samples):,} samples, "
               f"period_stats {dt * 1000:.3f} ms "
@@ -894,8 +895,8 @@ class TestPeriodColumns(Base):
         # in each window's exclusive band (plus one in W's left-edge
         # partial block, to pin its edge-max), and a 2000.0 spike in the
         # first week that only the lifetime column may see.
-        g = nb.Graph(10, interval=60)
-        n = 2 * nb.WEEK_SECS // 60
+        g = bg.Graph(10, interval=60)
+        n = 2 * bg.WEEK_SECS // 60
         data = [((i * 7919) % 13) / 100.0 if i % 7 == 0 else 0.0 for i in range(n)]
         data[10] = 2000.0            # first week: trimmed from the buffer, L only
         # the windows are nested (M inside h inside H inside D inside W),
@@ -911,14 +912,14 @@ class TestPeriodColumns(Base):
         stored = array.array("f", data)  # what the Graph actually keeps
         for v in data:
             g.add(v)
-        self.assertEqual(len(g.samples), nb.WEEK_SECS // 60)  # trimmed to one week
+        self.assertEqual(len(g.samples), bg.WEEK_SECS // 60)  # trimmed to one week
         # independent one-pass reference over the stored values
         ref = []
         for w in (5, 30, 60, 1440, 10080):  # M/h/H/D/W in samples at 60 s
             seg = stored[len(stored) - w:]
             ref.append((sum(seg) / len(seg), max(seg)))
         ref.append((sum(stored) / len(stored), max(stored)))  # L
-        stats = nb.period_stats(g)
+        stats = bg.period_stats(g)
         self.assertEqual(len(stats), 6)
         for (avg, mx), (r_avg, r_max) in zip(stats, ref):
             self.assertAlmostEqual(avg, r_avg, delta=1e-6)
