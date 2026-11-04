@@ -297,12 +297,13 @@ def _chat_first_chunk(api, model, prompt, max_tokens, timeout=120):
     with urllib.request.urlopen(req, timeout=timeout) as r:
         for raw in r:
             line = raw.decode("utf-8", "replace").strip()
-            if not line.startswith("data: "):
+            sse = "data: "
+            if not line.startswith(sse):
                 continue
-            if line[6:].strip() == "[DONE]":
+            if line[len(sse):].strip() == "[DONE]":
                 break
             try:
-                o = json.loads(line[6:].strip())
+                o = json.loads(line[len(sse):].strip())
             except ValueError:
                 continue
             d = (o.get("choices") or [{}])[0].get("delta", {})
@@ -317,6 +318,12 @@ def calibrate(url, log=print, burst=8):
     with `burst` parallel requests, the effective max concurrency and max
     decode t/s. Values are best-effort on a shared engine: if other users'
     traffic overlaps the test, the numbers drift. Returns a dict."""
+    # phase A probe: one large uncached prompt, a few decode steps are enough
+    # to reach the first chunk; phase B workers use short prompts but generate
+    # enough tokens to fill the decode window
+    probe_lines, probe_max_tokens = 250, 16
+    burst_lines, burst_max_tokens = 25, 240
+
     base = url.split("/metrics", 1)[0].rstrip("/")
     api = base + "/v1/chat/completions"
     m0 = fetch_metrics(url)
@@ -333,9 +340,9 @@ def calibrate(url, log=print, burst=8):
     pre0 = g(mA, "ninfer_prefill_tokens_total", 0.0)
     prompt_a = ("[calib %s] %s\nUsing the lines above as a glossary, write a short "
                 "technical note on tree attention for speculative decoding."
-                % (time.time_ns(), _rand_lines(250)))
+                % (time.time_ns(), _rand_lines(probe_lines)))
     t_sent = time.monotonic()
-    first_at, _ = _chat_first_chunk(api, model, prompt_a, 16)
+    first_at, _ = _chat_first_chunk(api, model, prompt_a, probe_max_tokens)
     if first_at is None:
         raise RuntimeError("engine returned no tokens during the prefill test")
     mB = fetch_metrics(url)
@@ -367,8 +374,8 @@ def calibrate(url, log=print, burst=8):
     def worker(n):
         try:
             p = ("[calib %s w%d] %s\nSummarize the glossary above in one sentence."
-                 % (time.time_ns(), n, _rand_lines(25)))
-            _chat_first_chunk(api, model, p, 240, timeout=90)
+                 % (time.time_ns(), n, _rand_lines(burst_lines)))
+            _chat_first_chunk(api, model, p, burst_max_tokens, timeout=90)
         except Exception:
             pass
 
@@ -674,8 +681,13 @@ class Engine:
             return None
 
 
+# seconds per day: the raw sample buffer keeps one day, and the D
+# summary window spans the whole kept buffer
+DAY_SECS = 86400
+
+
 class Graph:
-    """Scrolling bar history. The newest sample sits at the left edge: bars
+    """Scrolling bar history." The newest sample sits at the left edge: bars
     enter on the left and scroll out on the right. Two samples per drawn
     character (the newer in the left dot line), so a redraw after each poll
     shifts every dot line by exactly half a character - it can never jump,
@@ -699,13 +711,13 @@ class Graph:
     run, not the engine's life."""
 
     # M 1 min, h 30 min, H 1 h, D 1 day (== the kept raw history)
-    _PERIOD_SECS = (60, 1800, 3600, 86400)
+    _PERIOD_SECS = (60, 1800, 3600, DAY_SECS)
 
     def __init__(self, width, floor=0.0, pinned=False, interval=0.5):
         self.interval = interval if interval and interval > 0 else 0.5
         self.hist = deque(maxlen=width)
         self.samples = array.array("f")  # raw history, trimmed to the last day
-        self.day_cap = int(86400 / self.interval)  # one day of samples
+        self.day_cap = int(DAY_SECS / self.interval)  # one day of samples
         self.window_ns = tuple(
             max(1, int(secs / self.interval)) for secs in self._PERIOD_SECS
         )  # M/h/H/D window sizes in samples (D == the kept history)
@@ -836,16 +848,18 @@ def make_colors(scr):
     curses.start_color()
     curses.use_default_colors()
     c = {}
+    # 256-palette entries for the MhHDL summary columns (terminals that
+    # drop SGR-2 dim): 22 = #005f00, 100 = #878700
+    DARK_GREEN, DARK_OLIVE = 22, 100
     pairs = {
         "title": (curses.COLOR_CYAN, -1),
         "ok": (curses.COLOR_GREEN, -1),
         "bad": (curses.COLOR_RED, -1),
         "batch": (curses.COLOR_GREEN, -1),
         "toks": (curses.COLOR_YELLOW, -1),
-        # dimmed variants (256 palette) for the MhHDL summary columns;
-        # 16-color terminals fail to init the pair and fall back to A_DIM
-        "stat_batch": (22, -1),   # dark green
-        "stat_toks": (100, -1),   # darker yellow
+        # 16-color terminals fail to init the 256-palette pair and fall back to A_DIM
+        "stat_batch": (DARK_GREEN, -1),
+        "stat_toks": (DARK_OLIVE, -1),
         "label": (curses.COLOR_CYAN, -1),
         "dim": (curses.COLOR_WHITE, -1),
         "bar_dim": (curses.COLOR_BLACK, -1),
@@ -909,7 +923,7 @@ def draw_panel(scr, y, title, key, c, width, stats=None):
     """
     w = width - 1  # leave the last column empty (see note in frame())
     if stats:
-        suffix_len = 3 + sum(len(t) for t, _ in stats)  # "─  " + the stat text
+        suffix_len = len("─  ") + sum(len(t) for t, _ in stats)
         avail = max(0, w - 1 - suffix_len)  # title room after the leading "─"
         lead = "─" + title[:avail] + "─  "
         try:
@@ -959,7 +973,12 @@ def draw_triple_panel(scr, y, left_title, mid_title, right_title, c, width):
     return y + 1, s1, s2
 
 
-def _xfer_row(label, graph, width=13):
+# width of the one-row spill/recall graphs in characters; fixed and
+# independent of the terminal width (buffer = 2 samples per character)
+XFER_COLS = 13
+
+
+def _xfer_row(label, graph, width=XFER_COLS):
     """One cache-panel transfer row: a one-row braille graph over the
     graph's window (the same dots and double-wide characters as the main
     bar graphs - each character holds two adjacent samples, the newer in
@@ -1146,6 +1165,15 @@ def draw_bar_graph(scr, y, graph: Graph, rows, width, key, c):
     # the cur/min/max/avg figures live in the panel title banner now
     return y + rows + 1
 
+# --- layout constants
+
+# tallest a bar-graph plot may grow (braille rows)
+MAX_PLOT_ROWS = 6
+# minimum drawn terminal width (columns) for the layout
+MIN_WIDTH = 20
+# footer UTIL colour thresholds: "ok" below warn, "toks" below bad, "bad" at/above
+UTIL_WARN, UTIL_BAD = 0.7, 0.9
+
 
 def frame(scr, eng, graphs, c):
     scr.erase()
@@ -1201,7 +1229,8 @@ def frame(scr, eng, graphs, c):
                 break
             x += n
     elif CALIB and CALIB.get("error"):
-        msg = f"calibration failed: {CALIB['error'][:width - 25]}  (util n/a)"
+        prefix = "calibration failed: "  # 5 = margin before the trailing note
+        msg = f"{prefix}{CALIB['error'][:width - len(prefix) - 5]}  (util n/a)"
         if ctx_txt:
             msg += f"  ·  ctx {ctx_txt}"
         try:
@@ -1221,8 +1250,9 @@ def frame(scr, eng, graphs, c):
         # the banner sits below the header/calibration block and pushes the
         # panels down instead of sharing their rows
         try:
-            scr.addnstr(y, 0, f"cannot reach engine: {eng.last_err}",
-                        min(len(eng.last_err) + 20, width - 1), curses.color_pair(c.get("bad", 0)))
+            msg = "cannot reach engine: " + eng.last_err
+            scr.addnstr(y, 0, msg, min(len(msg) - 1, width - 1),
+                        curses.color_pair(c.get("bad", 0)))
             scr.addnstr(y + 1, 0, f"last good sample: {eng.last_good}", width - 1)
         except curses.error:
             pass
@@ -1245,11 +1275,11 @@ def frame(scr, eng, graphs, c):
     # scrape) the panel height falls back to the even three-way split; the
     # scale stays pinned to the height's dot count.
     if g_batch.floor > 0:
-        rows_batch = max(1, min(6, -(-int(g_batch.floor) // 4)))
+        rows_batch = max(1, min(MAX_PLOT_ROWS, -(-int(g_batch.floor) // 4)))
     else:
-        rows_batch = max(1, min(6, (max_y - fixed) // 3))
+        rows_batch = max(1, min(MAX_PLOT_ROWS, (max_y - fixed) // 3))
     # prefill/decode share the rows the batch panel does not use
-    plot_rows = max(1, min(6, (max_y - fixed - rows_batch) // 2))
+    plot_rows = max(1, min(MAX_PLOT_ROWS, (max_y - fixed - rows_batch) // 2))
 
     # --- batch panel
     b = (s or {}).get("running")
@@ -1369,7 +1399,7 @@ def frame(scr, eng, graphs, c):
     y = max_y - 1
     util = (s or {}).get("util")
     if util is not None:
-        ukey = "ok" if util < 0.7 else ("toks" if util < 0.9 else "bad")
+        ukey = "ok" if util < UTIL_WARN else ("toks" if util < UTIL_BAD else "bad")
         utext = f" UTIL {util * 100:5.1f}%"
     else:
         ukey, utext = "dim", "UTIL n/a "
@@ -1403,7 +1433,7 @@ def main_loop(stdscr, args):
     c = make_colors(stdscr)
 
     max_y, max_x = stdscr.getmaxyx()
-    gwidth = max(20, max_x - 1)  # drawn columns (x=1 .. max_x-1)
+    gwidth = max(MIN_WIDTH, max_x - 1)  # drawn columns (x=1 .. max_x-1)
     interval = args.interval / 1000.0
     # two samples per drawn character: the buffer holds exactly what the
     # scroll region draws (width-STAT_COLS chars = 2*(width-STAT_COLS)
@@ -1414,9 +1444,9 @@ def main_loop(stdscr, args):
     graphs = {"batch": Graph(2 * (gwidth - STAT_COLS), pinned=True, interval=interval),  # pinned: 1 dot = 1 request, always
               "toks": Graph(2 * (gwidth - STAT_COLS), interval=interval),
               "prefill": Graph(2 * (gwidth - STAT_COLS), interval=interval),
-              # transfer graphs: fixed 13-char width (26 samples ~ 13 s
-              # at the default 500 ms poll), independent of terminal width
-              "xfer_d2h": Graph(26), "xfer_h2d": Graph(26)}
+              # transfer graphs: fixed XFER_COLS-char width (2 samples per char,
+              # ~13 s at the default 500 ms poll), independent of terminal width
+              "xfer_d2h": Graph(2 * XFER_COLS), "xfer_h2d": Graph(2 * XFER_COLS)}
     eng = Engine(args.url, interval, args.pricing_rates, label=args.pricing_model)
     last_poll = 0.0
     running = True
@@ -1447,7 +1477,7 @@ def main_loop(stdscr, args):
         # resync graph width on terminal resize
         ny, nx = stdscr.getmaxyx()
         if abs(nx - 1 - gwidth) > 2:
-            gwidth = max(20, nx - 1)
+            gwidth = max(MIN_WIDTH, nx - 1)
             for k in ("batch", "toks", "prefill"):  # xfer graphs stay 13 chars
                 old = list(graphs[k].hist)
                 g2 = Graph(2 * (gwidth - STAT_COLS), floor=graphs[k].floor, pinned=graphs[k].pinned,
@@ -1462,7 +1492,7 @@ def main_loop(stdscr, args):
             # small sleep so we don't spin when no key
             time.sleep(0.05)
             continue
-        if ch in (ord("q"), ord("Q"), 27):
+        if ch in (ord("q"), ord("Q"), curses.KEY_ESCAPE):
             running = False
 
     return 0
