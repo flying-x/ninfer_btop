@@ -996,9 +996,9 @@ def draw_bar_graph(scr, y, graph: Graph, rows, width, key, c):
     # two samples per braille character: the plot is half the buffer wide;
     # the buffer holds oldest -> newest, but the newest sample is on the
     # left, so the window is read newest first
-    n = min(len(hist_vals), 2 * (width - 14))
+    n = min(len(hist_vals), 2 * (width - 1))
     grid = dots_to_chars(dots[-n:][::-1], rows)
-    plot_w = min(width - 14, (n + 1) // 2)
+    plot_w = min(width - 1, (n + 1) // 2)
     base_attr = curses.color_pair(c.get(key, 0))
     # the newest sample is on the left: the leftmost character holds it and
     # the second-newest sample, and the graph scrolls left to right (bars
@@ -1280,7 +1280,7 @@ def main_loop(stdscr, args):
     c = make_colors(stdscr)
 
     max_y, max_x = stdscr.getmaxyx()
-    gwidth = max(20, max_x - 16)
+    gwidth = max(20, max_x - 1)  # drawn columns (x=1 .. max_x-1)
     # two samples per drawn character: histories are twice the column count
     graphs = {"batch": Graph(2 * gwidth, pinned=True),  # pinned: scale = plot's dot count (1 dot = 1 request)
               "toks": Graph(2 * gwidth), "prefill": Graph(2 * gwidth),
@@ -1317,12 +1317,12 @@ def main_loop(stdscr, args):
 
         # resync graph width on terminal resize
         ny, nx = stdscr.getmaxyx()
-        if abs(nx - 16 - gwidth) > 2:
-            gwidth = max(20, nx - 16)
+        if abs(nx - 1 - gwidth) > 2:
+            gwidth = max(20, nx - 1)
             for k in ("batch", "toks", "prefill"):  # xfer graphs stay 13 chars
                 old = list(graphs[k].hist)
-                g2 = Graph(gwidth, floor=graphs[k].floor, pinned=graphs[k].pinned)
-                g2.hist.extend(old[-gwidth:])
+                g2 = Graph(2 * gwidth, floor=graphs[k].floor, pinned=graphs[k].pinned)
+                g2.hist.extend(old[-2 * gwidth:])
                 graphs[k] = g2
             frame(stdscr, eng, graphs, c)
 
