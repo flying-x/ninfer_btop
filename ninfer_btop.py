@@ -1079,16 +1079,23 @@ def period_stats(graph):
     return out
 
 
+# rightmost columns of each bar graph: one period summary per label
+# character (avg/max over the last minute / half-hour / hour / day /
+# process life); period_stats emits exactly len(STAT_LABEL) figures
+STAT_LABEL = "MhHDL"
+STAT_COLS = len(STAT_LABEL)
+
+
 def draw_bar_graph(scr, y, graph: Graph, rows, width, key, c):
     hist_vals = list(graph.hist)
     dots = graph.dots(rows)  # one dot height per sample
     # two samples per braille character: the plot is half the buffer wide;
     # the buffer holds oldest -> newest, but the newest sample is on the
     # left, so the window is read newest first
-    # the rightmost 5 columns are reserved for the MhHDL period summaries
-    n = min(len(hist_vals), 2 * (width - 5))
+    # the rightmost STAT_COLS columns are reserved for the MhHDL summaries
+    n = min(len(hist_vals), 2 * (width - STAT_COLS))
     grid = dots_to_chars(dots[-n:][::-1], rows)
-    plot_w = min(width - 5, (n + 1) // 2)
+    plot_w = min(width - STAT_COLS, (n + 1) // 2)
     base_attr = curses.color_pair(c.get(key, 0))
     # the newest sample is on the left: the leftmost character holds it and
     # the second-newest sample, and the graph scrolls left to right (bars
@@ -1123,17 +1130,17 @@ def draw_bar_graph(scr, y, graph: Graph, rows, width, key, c):
                 if ch == " ":
                     continue
                 try:
-                    scr.addstr(y + r, width - 4 + col, ch, stat_attr)
+                    scr.addstr(y + r, width - STAT_COLS + 1 + col, ch, stat_attr)
                 except curses.error:
                     pass
     # baseline; the period labels sit under their summary columns
     try:
-        scr.addnstr(y + rows, 1, "─" * (width - 5), width - 5)
+        scr.addnstr(y + rows, 1, "─" * (width - STAT_COLS), width - STAT_COLS)
     except curses.error:
         pass
     if stats:
         try:
-            scr.addnstr(y + rows, width - 4, "MhHDL", 5, stat_attr)
+            scr.addnstr(y + rows, width - STAT_COLS + 1, STAT_LABEL, STAT_COLS, stat_attr)
         except curses.error:
             pass
     # the cur/min/max/avg figures live in the panel title banner now
@@ -1399,13 +1406,14 @@ def main_loop(stdscr, args):
     gwidth = max(20, max_x - 1)  # drawn columns (x=1 .. max_x-1)
     interval = args.interval / 1000.0
     # two samples per drawn character: the buffer holds exactly what the
-    # scroll region draws (width-5 chars = 2*(width-5) samples) - the
-    # rightmost 5 columns are the MhHDL summaries, so a wider buffer would
+    # scroll region draws (width-STAT_COLS chars = 2*(width-STAT_COLS)
+    # samples) - the rightmost STAT_COLS columns are the MhHDL summaries,
+    # so a wider buffer would
     # hide scroll data under them and the banner max/avg/min (computed over
     # the buffer) would lag the visible plot
-    graphs = {"batch": Graph(2 * (gwidth - 5), pinned=True, interval=interval),  # pinned: 1 dot = 1 request, always
-              "toks": Graph(2 * (gwidth - 5), interval=interval),
-              "prefill": Graph(2 * (gwidth - 5), interval=interval),
+    graphs = {"batch": Graph(2 * (gwidth - STAT_COLS), pinned=True, interval=interval),  # pinned: 1 dot = 1 request, always
+              "toks": Graph(2 * (gwidth - STAT_COLS), interval=interval),
+              "prefill": Graph(2 * (gwidth - STAT_COLS), interval=interval),
               # transfer graphs: fixed 13-char width (26 samples ~ 13 s
               # at the default 500 ms poll), independent of terminal width
               "xfer_d2h": Graph(26), "xfer_h2d": Graph(26)}
@@ -1442,7 +1450,7 @@ def main_loop(stdscr, args):
             gwidth = max(20, nx - 1)
             for k in ("batch", "toks", "prefill"):  # xfer graphs stay 13 chars
                 old = list(graphs[k].hist)
-                g2 = Graph(2 * (gwidth - 5), floor=graphs[k].floor, pinned=graphs[k].pinned,
+                g2 = Graph(2 * (gwidth - STAT_COLS), floor=graphs[k].floor, pinned=graphs[k].pinned,
                            interval=graphs[k].interval)
                 g2.hist.extend(old[-2 * gwidth:])
                 g2.adopt_history(graphs[k])  # raw history + L aggregates
