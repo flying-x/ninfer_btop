@@ -38,7 +38,7 @@ effective max concurrency). The result is cached in ~/.ninfer_btop.json and
 reused on the next start while the engine's start time is unchanged (a
 restart re-benchmarks automatically); --re-calib drops the cache and forces
 a fresh benchmark. The device/host tier split of the token hit needs
---bytes-per-tok (exact context bytes per token, see bytes_per_token.md).
+--bytes-per-tok (exact context bytes per token, see docs/bytes_per_token.md).
 
 Standard library only (curses + urllib). No packages to install.
 

@@ -34,7 +34,7 @@ Polls the engine's Prometheus `/metrics` endpoint and renders:
   pre-unification engine builds show "n/a" per row). The cache panel shows
   "Tok hit" (token-level input hit: `ninfer_prompt_tokens_cached_total` ÷
   `ninfer_prompt_tokens_total`); when bytes-per-token is known via `--bytes-per-tok` (see
-  `bytes_per_token.md`), the
+  `docs/bytes_per_token.md`), the
   figure is split by serving tier — `xx% (device)xx% (host)` — an
   approximation: lifetime host→device recall bytes ÷ bytes-per-token ~ the
   cached tokens that had to be recalled from host RAM, the remainder was
@@ -177,6 +177,11 @@ unification build; live-verified 2026-11-02): `/metrics` renders
 `published_stats_`, which the engine worker republishes after every decode/prefill step
 (`engine_core.h` → `publish_runtime_stats()`), so the counters are real-time and a
 between-polls rate is the correct tokens/s signal.
+
+## Documentation
+
+- [docs/bytes_per_token.md](docs/bytes_per_token.md) — the exact KV bytes-per-token value to pass as `--bytes-per-tok`
+- [docs/graph_rendering.md](docs/graph_rendering.md) — how the braille graphs are built (`compute_dots` + `dots_to_chars`)
 
 ## TODO
 

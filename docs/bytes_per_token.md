@@ -1,5 +1,7 @@
 # bytes-per-token for the device/host hit split
 
+From the [ninfer_btop](https://github.com/flying-x/ninfer_btop) project — a btop-style TUI dashboard for the NInfer inference engine.
+
 `ninfer_btop` splits the token-level input hit into device- and
 host-served tiers by converting lifetime host→device recall bytes into
 tokens: `host_tokens = h2d_bytes / bpt` (clamped to the cached-token
@@ -47,3 +49,15 @@ ninfer KV storage per 256-dim head, per token, per plane
 In use: `--kv-dtype fp8 --spec mtp` → `--bytes-per-tok 33024`, which
 yields a sane live split (e.g. `59.9% (device)30.0% (host)` against a
 59.9%+30.0% of an ~89% input hit).
+
+
+## Best practices (for agent readers)
+
+- When a tool converts byte counters to token counts (or divides lifetime
+  counters to derive a rate), do not probe-measure the conversion factor at
+  runtime on a busy engine: the reading is a noisy lower bound, and one low
+  value skews the whole derivation over uptime (here the clamp saturates
+  and the split drifts to `0.0% (device)`).
+- Compute the exact factor from the model architecture and KV storage
+  layout (formula above) and expose it as an explicit parameter so the user
+  pins it (`--bytes-per-tok N`).
