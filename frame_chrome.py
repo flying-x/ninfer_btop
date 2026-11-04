@@ -5,24 +5,24 @@ Extracted from ninfer_btop.py so chrome edits (frame layout, status
 line, footer, colors/attributes, --text output, the main loop) stop
 fighting the bar-graph / KV-cache data code for the same file.
 
-Dependency direction: this module imports ninfer_btop (Engine, shared
-helpers) and bar_graphs (Graph, dot/braille rendering, period stats -
-a stdlib-only leaf); ninfer_btop imports THIS module only lazily,
-inside main(). So `import ninfer_btop` alone never pulls in the curses
-screen code. frame() takes the resolved calibration dict as a value (calib)
-instead of reading ninfer_btop's CALIB global.
+Dependency direction: this module imports metrics_calib (the
+metrics/calibration helpers) and bar_graphs (Graph, dot/braille rendering,
+period stats - both stdlib-only leaves), plus ninfer_btop (Engine, shared
+helpers); ninfer_btop imports THIS module only lazily, inside main(). So
+`import ninfer_btop` alone never pulls in the curses screen code. frame()
+takes the resolved calibration dict as a value (calib) instead of reading
+metrics_calib's calibration state (get_calib()).
 """
 import curses
 import time
 
 from bar_graphs import Graph, compute_dots, dots_to_chars, period_stats
+from metrics_calib import human, money
 from ninfer_btop import (
     Engine,
     XFER_COLS,
     _kv_row,
     _xfer_row,
-    human,
-    money,
 )
 
 # ---------------------------------------------------------------- text mode

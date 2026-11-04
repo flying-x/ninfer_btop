@@ -18,6 +18,7 @@ import unittest
 
 import bar_graphs as bg
 import frame_chrome as fc
+import metrics_calib as mc
 import ninfer_btop as nb
 
 
@@ -40,7 +41,7 @@ class _Resp:
 def fake_metrics(body):
     def _urlopen(url, timeout=5.0):
         return _Resp(body)
-    nb.urllib.request.urlopen = _urlopen
+    mc.urllib.request.urlopen = _urlopen
 
 
 class FakeScreen:
@@ -98,15 +99,15 @@ CALIB_OK = {"ok": True, "concurrency": 8, "prefill_tps": 100.0,
 
 class Base(unittest.TestCase):
     def setUp(self):
-        self._real_urlopen = nb.urllib.request.urlopen
-        self._real_calib_file = nb.CALIB_FILE
-        nb.CALIB = None
+        self._real_urlopen = mc.urllib.request.urlopen
+        self._real_calib_file = mc.CALIB_FILE
+        mc.set_calib(None)
         stub_curses()
 
     def tearDown(self):
-        nb.urllib.request.urlopen = self._real_urlopen
-        nb.CALIB_FILE = self._real_calib_file
-        nb.CALIB = None
+        mc.urllib.request.urlopen = self._real_urlopen
+        mc.CALIB_FILE = self._real_calib_file
+        mc.set_calib(None)
 
     def _sample(self, **over):
         """A plausible successful poll() frame; override any key via **over."""
@@ -130,7 +131,7 @@ class TestFetchMetricsLabels(Base):
     def test_A1_escaped_label_values_are_unescaped(self):
         body = r'ninfer_model_info{model_name="custom\"model\\name\nline",speculative_backend="eagle"} 1'
         fake_metrics(body)
-        m = nb.fetch_metrics("http://x/metrics")
+        m = mc.fetch_metrics("http://x/metrics")
         lbl = m["ninfer_model_info__labels"]
         self.assertEqual(lbl["model_name"], 'custom"model\\name\nline')
         self.assertEqual(lbl["speculative_backend"], "eagle")
@@ -138,7 +139,7 @@ class TestFetchMetricsLabels(Base):
     def test_A2_comma_inside_value_does_not_split(self):
         body = 'ninfer_model_info{model_name="my, model",speculative_backend="none"} 1'
         fake_metrics(body)
-        m = nb.fetch_metrics("http://x/metrics")
+        m = mc.fetch_metrics("http://x/metrics")
         lbl = m["ninfer_model_info__labels"]
         self.assertEqual(lbl["model_name"], "my, model")
         self.assertEqual(lbl["speculative_backend"], "none")
@@ -152,7 +153,7 @@ class TestFetchMetricsLabels(Base):
             'ninfer_requests_total{outcome="cancelled"} 2'
         )
         fake_metrics(body)
-        m = nb.fetch_metrics("http://x/metrics")
+        m = mc.fetch_metrics("http://x/metrics")
         self.assertEqual(m["ninfer_generation_tokens_total"], 123456789.0)
         self.assertEqual(m["ninfer_engine_ready"], 1.0)
         self.assertEqual(m["ninfer_requests_total"], 400.0)
@@ -161,7 +162,7 @@ class TestFetchMetricsLabels(Base):
     def test_A4_comment_blank_and_nonnumeric_are_skipped(self):
         body = "# TYPE ninfer_weird counter\n\nninfer_good 5\nninfer_notanum abc"
         fake_metrics(body)
-        m = nb.fetch_metrics("http://x/metrics")
+        m = mc.fetch_metrics("http://x/metrics")
         self.assertEqual(m["ninfer_good"], 5.0)
         self.assertNotIn("ninfer_notanum", m)
         self.assertNotIn("ninfer_weird", m)
@@ -181,17 +182,17 @@ class TestCalibrateModelName(Base):
         )
         fake_metrics(body)
         sent = []
-        real_chat = nb._chat_first_chunk
+        real_chat = mc._chat_first_chunk
 
         def fake_chat(api, model, prompt, max_tokens, timeout=120):
             sent.append(model)
             return (time.monotonic(), 0.1)
 
-        nb._chat_first_chunk = fake_chat
+        mc._chat_first_chunk = fake_chat
         try:
-            nb.calibrate("http://x/metrics", log=lambda *a: None, burst=1)
+            mc.calibrate("http://x/metrics", log=lambda *a: None, burst=1)
         finally:
-            nb._chat_first_chunk = real_chat
+            mc._chat_first_chunk = real_chat
         self.assertIn("my, model", sent)
         self.assertNotIn("my", sent)
 
@@ -233,7 +234,7 @@ class TestEnginePollRate(Base):
 
 class TestFrameDownState(Base):
     def frame(self, calib, ok):
-        nb.CALIB = calib
+        mc.set_calib(calib)
         scr = FakeScreen(40, 120)
         graphs = {k: bg.Graph(60) for k in ("batch", "toks", "prefill")}
         fc.frame(scr, make_engine(ok), graphs, {}, calib)
@@ -286,10 +287,10 @@ class TestPureFunctions(Base):
         for n, want in ((0, "0"), (999, "999"), (1000, "1.00K"),
                         (1000000, "1.00M"), (1200000000, "1.20G"),
                         (2500000000000, "2.50T")):
-            self.assertEqual(nb.human(n), want, "human(%r)" % n)
+            self.assertEqual(mc.human(n), want, "human(%r)" % n)
         for v, want in ((0, "$0.00"), (0.42, "$0.42"), (9.99, "$9.99"),
                         (1000, "$1,000"), (1200000, "$1.2M")):
-            self.assertEqual(nb.money(v), want, "money(%r)" % v)
+            self.assertEqual(mc.money(v), want, "money(%r)" % v)
 
     def test_E3_cloud_cost_math(self):
         prompt_total, cached, gen = 1000000, 100000, 500000
@@ -301,9 +302,9 @@ class TestPureFunctions(Base):
         )
         fake_metrics(body)
         s = nb.Engine("http://x/metrics", 0.5).poll()
-        expected = ((prompt_total - cached) / 1e6 * nb.CLOUD_IN_RATE
-                    + cached / 1e6 * nb.CLOUD_CACHE_RATE
-                    + gen / 1e6 * nb.CLOUD_OUT_RATE)
+        expected = ((prompt_total - cached) / 1e6 * mc.CLOUD_IN_RATE
+                    + cached / 1e6 * mc.CLOUD_CACHE_RATE
+                    + gen / 1e6 * mc.CLOUD_OUT_RATE)
         self.assertAlmostEqual(s["cloud_cost"], expected, places=6)
 
 
@@ -414,7 +415,7 @@ class TestCacheHealth(Base):
     def test_G4_poll_splits_token_hits_by_serving_tier(self):
         # calibrated at 1000 B/tok; 8MB of lifetime h2d recall => 8000 of
         # the 100000 cached tokens were served from host RAM, 92000 from VRAM
-        nb.CALIB = dict(CALIB_OK, bytes_per_tok=1000.0)
+        mc.set_calib(dict(CALIB_OK, bytes_per_tok=1000.0))
         body = ("ninfer_engine_ready 1\n"
                 "ninfer_prompt_tokens_total 1000000\n"
                 "ninfer_prompt_tokens_cached_total 100000\n"
@@ -429,7 +430,7 @@ class TestCacheHealth(Base):
     def test_G5_host_estimate_clamps_to_the_cached_total(self):
         # 200MB of h2d recall at 1000 B/tok would imply 200000 host-served
         # tokens, more than the 100000 actually cached -> clamp to the total
-        nb.CALIB = dict(CALIB_OK, bytes_per_tok=1000.0)
+        mc.set_calib(dict(CALIB_OK, bytes_per_tok=1000.0))
         body = ("ninfer_engine_ready 1\n"
                 "ninfer_prompt_tokens_total 1000000\n"
                 "ninfer_prompt_tokens_cached_total 100000\n"
@@ -456,7 +457,7 @@ class TestCacheHealth(Base):
         self.assertIn("46.0% (device)34.0% (host)", joined)
 
     def test_G7_without_calibration_the_plain_tok_hit_line_is_kept(self):
-        # setUp leaves nb.CALIB = None -> no bpt -> no tier split
+        # setUp leaves the calib state as None (mc.set_calib(None)) -> no bpt -> no tier split
         body = ("ninfer_engine_ready 1\n"
                 "ninfer_prompt_tokens_total 1000000\n"
                 "ninfer_prompt_tokens_cached_total 100000\n")
@@ -502,14 +503,14 @@ class TestCacheHealth(Base):
         nb.curses.color_pair = lambda i: 1 + i
         c = {"ok": 1, "bad": 2, "toks": 3, "dim": 4, "kv": 5, "title": 6,
              "batch": 7, "label": 8, "val": 9, "peak": 10}
-        nb.CALIB = dict(CALIB_OK)
+        mc.set_calib(dict(CALIB_OK))
         eng = make_engine(True)
         eng.m = {"ninfer_engine_ready": 1.0}
         eng.last_frame = self._sample(ctx_window=131072)
         eng.start_time = None
         graphs = {k: bg.Graph(60) for k in ("batch", "toks", "prefill")}
         scr = FakeScreen(40, 120)
-        fc.frame(scr, eng, graphs, c, nb.CALIB)
+        fc.frame(scr, eng, graphs, c, mc.get_calib())
         row1 = "".join(t for (y, x, t, a) in scr.writes if y == 1)
         self.assertIn("calibrated in", row1)
         self.assertIn("ctx 128.0 KiToks", row1)
@@ -518,20 +519,20 @@ class TestCacheHealth(Base):
         nb.curses.color_pair = lambda i: 1 + i
         c = {"ok": 1, "bad": 2, "toks": 3, "dim": 4, "kv": 5, "title": 6,
              "batch": 7, "label": 8, "val": 9, "peak": 10}
-        nb.CALIB = dict(CALIB_OK)
+        mc.set_calib(dict(CALIB_OK))
         eng = make_engine(True)
         eng.m = {"ninfer_engine_ready": 1.0}
         eng.last_frame = self._sample()  # no ctx_window key
         eng.start_time = None
         graphs = {k: bg.Graph(60) for k in ("batch", "toks", "prefill")}
         scr = FakeScreen(40, 120)
-        fc.frame(scr, eng, graphs, c, nb.CALIB)
+        fc.frame(scr, eng, graphs, c, mc.get_calib())
         row1 = "".join(t for (y, x, t, a) in scr.writes if y == 1)
         self.assertIn("calibrated in", row1)
         self.assertNotIn("KiToks", row1)
 
     def test_G12_no_calib_status_line_is_the_ctx_window(self):
-        nb.CALIB = None
+        mc.set_calib(None)
         eng = make_engine(True)
         eng.m = {"ninfer_engine_ready": 1.0}
         eng.last_frame = self._sample(ctx_window=131072)
@@ -543,9 +544,9 @@ class TestCacheHealth(Base):
         self.assertIn("128.0 KiToks", row1)
 
     def test_G8_explicit_bytes_per_tok_works_without_calibration(self):
-        # --bytes-per-tok without calibration data: CALIB has no "ok" key,
+        # --bytes-per-tok without calibration data: get_calib() has no "ok" key,
         # the split still works and utilization stays n/a
-        nb.CALIB = {"bytes_per_tok": 1000.0}
+        mc.set_calib({"bytes_per_tok": 1000.0})
         body = ("ninfer_engine_ready 1\n"
                 "ninfer_prompt_tokens_total 1000000\n"
                 "ninfer_prompt_tokens_cached_total 100000\n"
@@ -569,7 +570,7 @@ class TestXferSpillRecall(Base):
                 "ninfer_context_transfer_bytes_total{resource=\"main_kv\",direction=\"h2d\"} 20\n"
                 "ninfer_context_transfer_bytes_total{resource=\"backend_kv\",direction=\"d2d\"} 7\n")
         fake_metrics(body)
-        m = nb.fetch_metrics("http://x/metrics")
+        m = mc.fetch_metrics("http://x/metrics")
         ser = m["ninfer_context_transfer_bytes_total__series"]
         self.assertEqual(len(ser), 5)
         spill = sum(v for (kv, v) in ser if kv.get("direction") == "d2h")
@@ -666,7 +667,7 @@ class TestBatchHeight(Base):
     character resolves 4 dot levels = 4 concurrent requests)."""
 
     def _panel_height(self, floor, calib, max_y=40):
-        nb.CALIB = calib
+        mc.set_calib(calib)
         scr = FakeScreen(max_y, 120)
         eng = make_engine(True)
         eng.last_frame = self._sample()
@@ -955,7 +956,7 @@ class TestPricingLoader(Base):
     def test_I1_loader_parses_sample_yaml(self):
         path = self._write_yaml(self.SAMPLE)
         try:
-            p = nb.load_pricing(path)
+            p = mc.load_pricing(path)
         finally:
             os.unlink(path)
         self.assertEqual(p, {
@@ -967,7 +968,7 @@ class TestPricingLoader(Base):
                 self.assertIsInstance(v, float)
 
     def test_I2_missing_file_falls_back_to_default_row(self):
-        p = nb.load_pricing("/no/such/pricing.yaml")
+        p = mc.load_pricing("/no/such/pricing.yaml")
         self.assertEqual(set(p), {"qwen3.8-27b"})
         self.assertEqual(p["qwen3.8-27b"],
                          {"input": 0.5, "cached_input": 0.05, "output": 3.0})
@@ -975,7 +976,7 @@ class TestPricingLoader(Base):
     def test_I3_key_indexing_selects_the_right_row(self):
         path = self._write_yaml(self.SAMPLE)
         try:
-            p = nb.load_pricing(path)
+            p = mc.load_pricing(path)
         finally:
             os.unlink(path)
         self.assertEqual(p["qwen3.8-27b"],
@@ -1018,21 +1019,21 @@ class TestPricingLoader(Base):
         eng = nb.Engine("http://x/metrics", 0.5)  # no rates supplied
         self.assertEqual(eng.rates,
                          {"input": 0.5, "cached_input": 0.05, "output": 3.0})
-        self.assertEqual(eng.rates, dict(nb.DEFAULT_PRICING["qwen3.8-27b"]))
+        self.assertEqual(eng.rates, dict(mc.DEFAULT_PRICING["qwen3.8-27b"]))
         # the module aliases still resolve to that default row's values
-        row = nb.DEFAULT_PRICING["qwen3.8-27b"]
-        self.assertEqual(nb.CLOUD_IN_RATE, row["input"])
-        self.assertEqual(nb.CLOUD_CACHE_RATE, row["cached_input"])
-        self.assertEqual(nb.CLOUD_OUT_RATE, row["output"])
+        row = mc.DEFAULT_PRICING["qwen3.8-27b"]
+        self.assertEqual(mc.CLOUD_IN_RATE, row["input"])
+        self.assertEqual(mc.CLOUD_CACHE_RATE, row["cached_input"])
+        self.assertEqual(mc.CLOUD_OUT_RATE, row["output"])
 
     def test_I6_real_pricing_yaml_has_the_supported_models(self):
         # I1-I5 exercise the parser on a synthetic sample; this guards the file
         # actually shipped in the repo. Rates are the International-scope Alibaba
         # Cloud Model Studio list prices, verified 2026-10-15 - update this
         # alongside pricing.yaml if those change.
-        self.assertTrue(os.path.exists(nb.pricing_file_path()),
+        self.assertTrue(os.path.exists(mc.pricing_file_path()),
                         "pricing.yaml is missing next to the script")
-        p = nb.load_pricing()  # resolves pricing.yaml next to ninfer_btop.py
+        p = mc.load_pricing()  # resolves pricing.yaml next to ninfer_btop.py
         # the real file was found and parsed (not the 1-key built-in fallback),
         # and it holds exactly the three models the ninfer engine ships
         self.assertEqual(set(p),
@@ -1065,8 +1066,8 @@ class TestCalibCache(Base):
             "server_start_time": 1000.0}
 
     def _cache_file(self):
-        nb.CALIB_FILE = tempfile.mktemp(suffix=".json")
-        return nb.CALIB_FILE
+        mc.CALIB_FILE = tempfile.mktemp(suffix=".json")
+        return mc.CALIB_FILE
 
     def _write_cache(self, url, start, path):
         with open(path, "w") as f:
@@ -1076,9 +1077,9 @@ class TestCalibCache(Base):
 
     def test_K1_no_file_benchmarks_and_caches(self):
         path = self._cache_file()
-        nb.resolve_calib(self.URL, run=lambda: setattr(nb, "CALIB", dict(self.GOOD)),
+        mc.resolve_calib(self.URL, run=lambda: mc.set_calib(dict(self.GOOD)),
                          probe=lambda u: 1000.0)
-        self.assertEqual(nb.CALIB, self.GOOD)
+        self.assertEqual(mc.get_calib(), self.GOOD)
         j = json.load(open(path))
         self.assertEqual(j["url"], self.URL)
         self.assertEqual(j["server_start_time"], 1000.0)
@@ -1088,11 +1089,11 @@ class TestCalibCache(Base):
         path = self._cache_file()
         self._write_cache(self.URL, 1000.0, path)
         ran = []
-        nb.resolve_calib(self.URL, run=lambda: ran.append(1), probe=lambda u: 1000.0)
+        mc.resolve_calib(self.URL, run=lambda: ran.append(1), probe=lambda u: 1000.0)
         self.assertEqual(ran, [])
-        self.assertTrue(nb.CALIB["ok"])
-        self.assertEqual(nb.CALIB["concurrency"], 4)
-        self.assertNotIn("server_start_time", nb.CALIB)  # cache dict shape
+        self.assertTrue(mc.get_calib()["ok"])
+        self.assertEqual(mc.get_calib()["concurrency"], 4)
+        self.assertNotIn("server_start_time", mc.get_calib())  # cache dict shape
 
     def test_K3_restarted_engine_benchmarks_and_rewrites_cache(self):
         path = self._cache_file()
@@ -1100,9 +1101,9 @@ class TestCalibCache(Base):
         def run():
             c = dict(self.GOOD)
             c["server_start_time"] = 2000.0
-            nb.CALIB = c
-        nb.resolve_calib(self.URL, run=run, probe=lambda u: 2000.0)
-        self.assertEqual(nb.CALIB["server_start_time"], 2000.0)
+            mc.set_calib(c)
+        mc.resolve_calib(self.URL, run=run, probe=lambda u: 2000.0)
+        self.assertEqual(mc.get_calib()["server_start_time"], 2000.0)
         self.assertEqual(json.load(open(path))["server_start_time"], 2000.0)
 
     def test_K4_re_calib_drops_cache_and_always_benchmarks(self):
@@ -1111,9 +1112,9 @@ class TestCalibCache(Base):
         ran = []
         def run():
             ran.append(1)
-            nb.CALIB = dict(self.GOOD)
+            mc.set_calib(dict(self.GOOD))
         # start time still matches - only the flag forces the fresh run
-        nb.resolve_calib(self.URL, re_calib=True, run=run, probe=lambda u: 1000.0)
+        mc.resolve_calib(self.URL, re_calib=True, run=run, probe=lambda u: 1000.0)
         self.assertEqual(ran, [1])
         # the dropped cache is rewritten with the fresh result
         self.assertEqual(json.load(open(path))["url"], self.URL)
@@ -1122,14 +1123,14 @@ class TestCalibCache(Base):
         path = self._cache_file()
         self._write_cache("http://y/metrics", 1000.0, path)
         ran = []
-        nb.resolve_calib(self.URL, run=lambda: ran.append(1) or setattr(nb, "CALIB", {"ok": False}),
+        mc.resolve_calib(self.URL, run=lambda: ran.append(1) or mc.set_calib({"ok": False}),
                          probe=lambda u: 1000.0)
         self.assertEqual(ran, [1])
 
     def test_K6_failed_calibration_is_not_cached(self):
         path = self._cache_file()
-        nb.resolve_calib(self.URL,
-                         run=lambda: setattr(nb, "CALIB", {"ok": False, "error": "boom"}),
+        mc.resolve_calib(self.URL,
+                         run=lambda: mc.set_calib({"ok": False, "error": "boom"}),
                          probe=lambda u: None)
         self.assertFalse(os.path.exists(path))
 
@@ -1137,36 +1138,36 @@ class TestCalibCache(Base):
         # a directory where the cache file should be: os.remove raises
         # IsADirectoryError - must abort, not leave the stale cache in place
         d = tempfile.mkdtemp()
-        nb.CALIB_FILE = d
+        mc.CALIB_FILE = d
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             with self.assertRaises(SystemExit) as ctx:
-                nb.resolve_calib(self.URL, re_calib=True,
-                                 run=lambda: setattr(nb, "CALIB", dict(self.GOOD)),
+                mc.resolve_calib(self.URL, re_calib=True,
+                                 run=lambda: mc.set_calib(dict(self.GOOD)),
                                  probe=lambda u: 1000.0)
         self.assertEqual(ctx.exception.code, 1)
         self.assertIn("cannot remove", err.getvalue())
 
     def test_K8_unwritable_cache_aborts_after_benchmark(self):
         d = tempfile.mkdtemp()
-        nb.CALIB_FILE = os.path.join(d, "no", "such", "cache.json")
+        mc.CALIB_FILE = os.path.join(d, "no", "such", "cache.json")
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             with self.assertRaises(SystemExit) as ctx:
-                nb.resolve_calib(self.URL,
-                                 run=lambda: setattr(nb, "CALIB", dict(self.GOOD)),
+                mc.resolve_calib(self.URL,
+                                 run=lambda: mc.set_calib(dict(self.GOOD)),
                                  probe=lambda u: 1000.0)
         self.assertEqual(ctx.exception.code, 1)
         self.assertIn("cannot write", err.getvalue())
 
     def test_K9_unreadable_cache_aborts_before_benchmark(self):
         d = tempfile.mkdtemp()
-        nb.CALIB_FILE = d  # open-for-read on a directory raises IsADirectoryError
+        mc.CALIB_FILE = d  # open-for-read on a directory raises IsADirectoryError
         ran = []
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             with self.assertRaises(SystemExit) as ctx:
-                nb.resolve_calib(self.URL, run=lambda: ran.append(1),
+                mc.resolve_calib(self.URL, run=lambda: ran.append(1),
                                  probe=lambda u: 1000.0)
         self.assertEqual(ctx.exception.code, 1)
         self.assertEqual(ran, [])  # no benchmark spent on a doomed run
@@ -1179,10 +1180,10 @@ class TestCalibCache(Base):
         ran = []
         def run():
             ran.append(1)
-            nb.CALIB = dict(self.GOOD)
+            mc.set_calib(dict(self.GOOD))
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            nb.resolve_calib(self.URL, run=run, probe=lambda u: 1000.0)
+            mc.resolve_calib(self.URL, run=run, probe=lambda u: 1000.0)
         self.assertEqual(ran, [1])
         self.assertIn("not valid JSON", err.getvalue())
         j = json.load(open(path))  # the fresh run rewrote the corrupt file
