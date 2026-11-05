@@ -434,6 +434,8 @@ def save_calib_cache(url, calib):
     benchmark is never cached."""
     st = calib.get("server_start_time")
     if not st:
+        # endpoint exposes no server_start_time: cache is skipped silently;
+        # the next start re-benchmarks (a rare but benign miss)
         return
     try:
         with open(CALIB_FILE, "w") as f:
