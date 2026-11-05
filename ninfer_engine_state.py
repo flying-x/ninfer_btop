@@ -139,7 +139,6 @@ class NinferEngineState:
             dev_cached = pool(m, "ninfer_context_pool_live_bytes", "device", "cached")
             dev_peak = pool(m, "ninfer_context_pool_peak_bytes", "device")
             host_cap = pool(m, "ninfer_context_pool_bytes", "host", "capacity")
-            host_inuse = pool(m, "ninfer_context_pool_live_bytes", "host", "in_use")
             host_cached = pool(m, "ninfer_context_pool_live_bytes", "host", "cached")
             host_peak = pool(m, "ninfer_context_pool_peak_bytes", "host")
             self.m = m
