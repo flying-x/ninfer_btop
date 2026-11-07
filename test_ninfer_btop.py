@@ -14,6 +14,7 @@ import sys
 import tempfile
 import textwrap
 import time
+import types
 import unittest
 
 import bar_graphs as bg
@@ -124,6 +125,417 @@ class Base(unittest.TestCase):
              "tok_hit": 0.10, "req_hit": 0.25}
         s.update(over)
         return s
+
+
+# ------------------------------------- S. period/agg selector (phase 1)
+
+class _LoopScreen(FakeScreen):
+    """FakeScreen + scripted getch; snapshots each rendered frame's writes."""
+
+    def __init__(self, keys, maxy=40, maxx=120):
+        super().__init__(maxy, maxx)
+        self.keys = list(keys)
+        self.frames = []
+
+    def curs_set(self, v):
+        pass
+
+    def nodelay(self, v):
+        pass
+
+    def keypad(self, v):
+        pass
+
+    def getch(self):
+        return self.keys.pop(0) if self.keys else -1
+
+    def erase(self):
+        if self.writes:
+            self.frames.append(self.writes)
+        self.writes = []
+
+    def rendered_frames(self):
+        return self.frames + ([self.writes] if self.writes else [])
+
+
+def _footer_row(scr, frame):
+    """(x, text, attr) writes on the footer row (row maxy-1) of one frame."""
+    y = scr.maxy - 1
+    return [(x, t, a) for (yy, x, t, a) in frame if yy == y]
+
+
+def _run_loop(keys, has_color=False):
+    """Drive tui.main_loop to completion with scripted keys; (scr, frames)."""
+    if has_color:
+        nb.curses.curs_set = lambda v: None
+        nb.curses.has_colors = lambda: True
+        nb.curses.start_color = lambda: None
+        nb.curses.use_default_colors = lambda: None
+        nb.curses.init_pair = lambda i, fg, bg: None
+        nb.curses.color_pair = lambda i: 1 + i   # distinct, inspectable pair ids
+    else:
+        nb.curses.curs_set = lambda v: None
+        nb.curses.has_colors = lambda: False
+        nb.curses.color_pair = lambda i: 0
+    scr = _LoopScreen(keys)
+    args = types.SimpleNamespace(interval=500, url="http://x/metrics",
+                                 pricing_rates=None, pricing_model=None)
+    rc = tui.main_loop(scr, args)
+    assert rc == 0
+    return scr, scr.rendered_frames()
+
+
+class TestPeriodAggSelector(Base):
+    """S: main_loop period/agg keys + footer selector rendering (phase 1).
+
+    Phase 1 draws live data for every period value - the tests only
+    assert the selector state/rendering, not the plotted data.
+    """
+
+    BODY = "ninfer_engine_ready 1\n"
+
+    def _run(self, keys, has_color=False):
+        fake_metrics(self.BODY)
+        return _run_loop(keys, has_color)
+
+    def test_S1_key_tables_cover_exactly_the_planned_keys(self):
+        self.assertEqual(set(tui.PERIOD_KEYS.values()), set("nmhHdwl"))
+        self.assertEqual(set(tui.AGG_KEYS.values()), set("AM"))
+        quit_keys = {ord("q"), ord("Q"), tui.KEY_ESCAPE}
+        self.assertFalse(set(tui.PERIOD_KEYS) & quit_keys)
+        self.assertFalse(set(tui.AGG_KEYS) & quit_keys)
+        self.assertEqual([k for k, _ in tui.PERIOD_LABELS], list("nmhHdwl"))
+        self.assertEqual([k for k, _ in tui.AGG_LABELS], list("AM"))
+
+    def test_S2_selector_segments_underline_only_the_active_entries(self):
+        nb.curses.color_pair = lambda i: 1 + i
+        c = {"dim": 1, "label": 8}
+        segs = tui.selector_segments("h", "M", c)
+        text = "".join(t for t, _ in segs)
+        self.assertEqual(text, "  period=now 5m 30m 1h 1d 1w life  agg fn=Avg Max")
+        active = [(t, a) for t, a in segs if a != nb.curses.color_pair(1)]
+        # period "h" = 30 minutes; only the matching period entry + agg entry are active
+        self.assertEqual([t.strip() for t, _ in active], ["30m", "Max"])
+        want = nb.curses.color_pair(8) | nb.curses.A_UNDERLINE
+        self.assertTrue(all(a == want for _, a in active))
+
+    def test_S3_selector_falls_back_to_bold_without_colors(self):
+        segs = tui.selector_segments("w", "A", {})
+        active = [a for _, a in segs if a != nb.curses.color_pair(0)]
+        # one active entry per dimension: period "w" + agg "A"
+        self.assertEqual(active, [nb.curses.A_BOLD, nb.curses.A_BOLD])
+
+    def test_S4_period_key_m_moves_the_active_marker(self):
+        scr, frames = self._run([ord("m"), ord("q")])
+        first, last = frames[0], frames[-1]
+
+        def active_labels(frame):
+            return {t.strip() for (x, t, a) in _footer_row(scr, frame)
+                    if a == nb.curses.A_BOLD}
+        self.assertIn("now", active_labels(first))       # default period
+        self.assertNotIn("now", active_labels(last))
+        self.assertIn("5m", active_labels(last))
+        for lab in ("30m", "1h", "1d", "1w", "life"):
+            self.assertNotIn(lab, active_labels(last))
+
+    def test_S5_all_period_keys_switch_the_selection(self):
+        labels = {"n": "now", "m": "5m", "h": "30m", "H": "1h",
+                  "d": "1d", "w": "1w", "l": "life"}
+        for k in "nmhHdwl":
+            scr, frames = self._run([ord(k), ord("q")])
+            last = frames[-1]
+            act = [t.strip() for (x, t, a) in _footer_row(scr, last)
+                   if a == nb.curses.A_BOLD and t.strip() in set(labels.values())]
+            self.assertEqual(act, [labels[k]], f"key {k!r}")
+
+    def test_S6_agg_keys_M_A_toggle_the_active_agg(self):
+        scr, frames = self._run([ord("M"), ord("A"), ord("q")])
+
+        def active_agg(frame):
+            out = [t.strip() for (x, t, a) in _footer_row(scr, frame)
+                   if a == nb.curses.A_BOLD and t.strip() in ("Avg", "Max")]
+            self.assertEqual(len(out), 1)
+            return out[0]
+        self.assertEqual(active_agg(frames[0]), "Max")   # default agg
+        self.assertEqual(active_agg(frames[1]), "Max")
+        self.assertEqual(active_agg(frames[2]), "Avg")
+
+    def test_S7_color_run_underlines_active_with_the_label_pair(self):
+        scr, frames = self._run([ord("H"), ord("q")], has_color=True)
+        last = frames[-1]
+        # make_colors pair order: title=1 ok=2 bad=3 batch=4 toks=5
+        # stat_batch=6 stat_toks=7 label=8 dim=9 bar_dim=10 val=11 kv=12 peak=13
+        want = nb.curses.color_pair(8) | nb.curses.A_UNDERLINE
+        self.assertEqual([a for (x, t, a) in _footer_row(scr, last) if t.strip() == "1h"], [want])
+        self.assertNotIn(want, [a for (x, t, a) in _footer_row(scr, last) if t.strip() == "now"])
+
+    def test_S8_frame_without_sel_keeps_the_old_footer(self):
+        c = {"ok": 1, "bad": 2, "toks": 3, "dim": 4, "kv": 5, "title": 6,
+             "batch": 7, "label": 8, "val": 9, "peak": 10}
+        s = self._sample()
+        eng = make_engine(True)
+        eng.m = {"ninfer_engine_ready": 1.0}
+        eng.last_frame = s
+        graphs = {k: bg.Graph(60) for k in ("batch", "toks", "prefill")}
+        scr = FakeScreen(40, 120)
+        tui.frame(scr, eng, graphs, c)
+        joined = "".join(t for (_, _, t, _) in scr.writes)
+        self.assertNotIn("period=", joined)
+        self.assertNotIn("agg fn=", joined)
+
+    def test_S9_narrow_terminal_truncates_the_selector_tail_first(self):
+        c = {"ok": 1, "bad": 2, "toks": 3, "dim": 4, "kv": 5, "title": 6,
+             "batch": 7, "label": 8, "val": 9, "peak": 10}
+        # no cloud cost: the footer stays short so the selector head reaches the right edge
+        s = self._sample(cloud_cost=None)
+        eng = make_engine(True)
+        eng.m = {"ninfer_engine_ready": 1.0}
+        eng.last_frame = s
+        graphs = {k: bg.Graph(60) for k in ("batch", "toks", "prefill")}
+        scr = FakeScreen(30, 45)
+        tui.frame(scr, eng, graphs, c, None, ("w", "M"))
+        foot = [t for (y, x, t, a) in scr.writes if y == scr.maxy - 1]
+        self.assertTrue(any(t.startswith(" q quit") for t in foot))
+        self.assertTrue(any("UTIL" in t for t in foot))
+        joined = "".join(foot)
+        self.assertIn("now", joined)          # selector head survives
+        self.assertNotIn("agg fn=", joined)     # selector tail truncates first
+
+
+class TestPlotSamplesWiring(Base):
+    """T: draw_bar_graph sources main-graph samples from Graph.plot_samples
+    (phase 2): the three main graphs plot the selected period/agg, the xfer
+    graphs keep the live 13-char window, compute_dots/dots_to_chars are
+    untouched. Compressed non-pinned views scale against the raw window
+    peak (graph.plot_peak) - one scale shared by both aggs, so the Avg
+    dilution is visible on the plot; pinned views and the live view keep
+    graph.dot_scale.
+    """
+
+    def _spiky_graph(self):
+        """4600 samples @0.5s: 1000 zeros, then a 30-minute region holding
+        one 10.0 spike every 50 samples - every 52/53-sample 'h' bucket
+        contains a spike, so the window max is 10.0, the same as the
+        lifetime peak (the scale choice cannot be seen from this graph;
+        test_T4 drives that distinction).
+        """
+        g = bg.Graph(60, interval=0.5)
+        for _ in range(1000):
+            g.add(0.0)
+        for i in range(3600):
+            g.add(10.0 if i % 50 == 0 else 0.0)
+        return g
+
+    def _frame(self, agg):
+        c = {"toks": 1, "stat_toks": 2, "dim": 3}
+        scr = FakeScreen(10, 41)   # width 40 -> plot_len 34 -> 68 buckets
+        y = tui.draw_bar_graph(scr, 0, self._spiky_graph(), 1, 40, "toks", c,
+                               period="h", agg=agg)
+        self.assertEqual(y, 2)     # 1 plot row + baseline, returned next row
+        return scr
+
+    def test_T1_compressed_frame_agg_max_draws_full_buckets(self):
+        scr = self._frame("M")
+        plot = [t for (yy, x, t, a) in scr.writes if yy == 0 and x <= 34]
+        self.assertEqual(plot, ["⣿"] * 34)
+        base = "".join(t for (yy, x, t, a) in scr.writes if yy == 1)
+        self.assertIn("30 minutes", base)   # the real selected span
+        self.assertIn("MhHDWL", base)       # period columns untouched
+
+    def test_T2_agg_avg_measures_against_the_raw_window_peak(self):
+        # the A-agg view scales against the RAW window peak
+        # (plot_peak = 10.0, the spike) - the same scale T1's M view uses,
+        # not the plotted max. The diluted bucket averages (~0.19) sit on
+        # the 1-dot floor: that floor is the dilution, visible against
+        # T1's full M bars (switching Avg<->Max changes the bar heights).
+        scr = self._frame("A")
+        plot = [t for (yy, x, t, a) in scr.writes if yy == 0 and x <= 34]
+        self.assertEqual(plot, ["⣀"] * 34)         # 1 dot per bucket
+        g = self._spiky_graph()
+        self.assertEqual(g.plot_peak("h"), 10.0)    # the shared scale
+        vals = g.plot_samples("h", "A", 68)
+        self.assertEqual(set(bg.compute_dots(vals,
+                                             max=g.plot_peak("h"),
+                                             total_dots=4)),
+                         {1})  # every diluted bucket lands on the floor
+
+    def test_T4_burst_outside_the_window_is_excluded_from_the_scale(self):
+        """6.1k samples @0.5s: a 3000.0 burst older than the 30-minute
+        window, steady 100/300 traffic inside it. The scale is the raw
+        WINDOW peak (plot_peak = 300): the burst outside the window is
+        excluded from it, so the steady traffic keeps its full 2-4 dot
+        range; scaled to the lifetime peak (3000) every steady bucket
+        would land on the 1-dot floor (the frozen line a past burst left
+        behind).
+        """
+        g = bg.Graph(60, interval=0.5)
+        def chunk(n, off=0):
+            for i in range(n):
+                g.add(300.0 if ((i + off) // 500) % 2 else 100.0)
+        chunk(2000)
+        for _ in range(100):
+            g.add(3000.0)
+        chunk(4000, 250)
+        c = {"toks": 1, "stat_toks": 2, "dim": 3}
+        scr = FakeScreen(10, 41)
+        tui.draw_bar_graph(scr, 0, g, 1, 40, "toks", c, period="h", agg="A")
+        plot = [t for (yy, x, t, a) in scr.writes if yy == 0 and x <= 34]
+        self.assertEqual(g.plot_peak("h"), 300.0)  # burst outside: excluded
+        self.assertEqual(plot,
+                         ["⣤"] * 2 + ["⣾"] + ["⣿"] * 4 + ["⣤"] * 4
+                         + ["⣴"] + ["⣿"] * 4 + ["⣧"] + ["⣤"] * 4
+                         + ["⣾"] + ["⣿"] * 4 + ["⣤"] * 4 + ["⣼"]
+                         + ["⣿"] * 3)
+        self.assertGreater(len(set(plot)), 1)      # not a flat line
+        self.assertNotIn("⣀", plot)                # no 1-dot floor
+        vals = g.plot_samples("h", "A", 68)
+        self.assertEqual(bg.compute_dots(vals,
+                                         max=g.dot_scale(1),
+                                         total_dots=4),
+                         [1] * len(vals))  # the lifetime-peak scale would
+                                           # freeze the window at one dot
+
+    def test_T5_pinned_graph_stays_pinned_under_aggregation(self):
+        # pinned graphs map against the plot's total dot count (one dot =
+        # one request), never against the plotted data: 2.0 steady traffic
+        # on a 4-dot plot draws 2 dots - scaling to the window peak would
+        # have drawn 4. The fixed axis also makes the young buffer's
+        # history visible: only the buckets the 200 samples cover draw,
+        # the rest stay empty instead of stretching across the width.
+        g = bg.Graph(60, pinned=True, interval=0.5)
+        for _ in range(200):
+            g.add(2.0)
+        c = {"toks": 1, "stat_toks": 2, "dim": 3}
+        scr = FakeScreen(10, 41)
+        tui.draw_bar_graph(scr, 0, g, 1, 40, "toks", c, period="h", agg="A")
+        plot = [t for (yy, x, t, a) in scr.writes if yy == 0 and x <= 34]
+        self.assertEqual(plot, ["⣤"] * 2)   # 2/4 dots, only covered buckets
+        self.assertNotIn("⣿", plot)         # no full-height window-peak bars
+
+    def test_T3_unselected_path_is_the_pre_phase2_draw(self):
+        c = {"toks": 1, "stat_toks": 2, "dim": 3}
+        g = bg.Graph(60, interval=0.5)
+        for v in (0.0, 10.0, 0.0, 0.0, 20.0):
+            g.add(v)
+        scr = FakeScreen(10, 41)
+        tui.draw_bar_graph(scr, 0, g, 1, 40, "toks", c)   # period=None
+        plot = [t for (yy, x, t, a) in scr.writes if yy == 0 and x <= 34]
+        # raw hist tail newest-first: [20, 0, 0, 10, 0] -> (4,0) (0,2) (0,0);
+        # the newer sample sits in the left dot line of its character
+        self.assertEqual(plot, ["⡇", "⢠"])
+        base = "".join(t for (yy, x, t, a) in scr.writes if yy == 1)
+        self.assertIn("34 seconds", base)                 # width-derived span
+        self.assertNotIn("30 minutes", base)
+
+    def test_T6_switching_agg_changes_bar_heights(self):
+        # the user symptom: with the old per-agg rescale (scale = plotted
+        # max) the Avg and Max plots looked identical, so switching the
+        # agg changed nothing visible. Against the shared raw window peak
+        # (plot_peak = 50.0, the spike) the young buffer's one spike draws
+        # a full M bar and a 1-dot A bar (50/53 diluted) at the same spot.
+        g = bg.Graph(60, interval=0.5)
+        for _ in range(59):
+            g.add(0.0)
+        g.add(50.0)
+        c = {"toks": 1, "stat_toks": 2, "dim": 3}
+        scr_a = FakeScreen(10, 41)
+        tui.draw_bar_graph(scr_a, 0, g, 1, 40, "toks", c, period="h", agg="A")
+        scr_m = FakeScreen(10, 41)
+        tui.draw_bar_graph(scr_m, 0, g, 1, 40, "toks", c, period="h", agg="M")
+        plot_a = [t for (yy, x, t, a) in scr_a.writes if yy == 0 and x <= 34]
+        plot_m = [t for (yy, x, t, a) in scr_m.writes if yy == 0 and x <= 34]
+        self.assertNotEqual(plot_a, plot_m)   # the agg is visible
+        self.assertEqual(plot_m, ["⡇"])      # M: 50.0 on the 50.0 peak = full
+        self.assertEqual(plot_a, ["⡀"])      # A: 50/53 diluted = 1 dot
+    def test_T7_life_period_draws_trimmed_history(self):
+        # 'l' over the coarse lifetime hour table: hist_cap=100 trims the
+        # raw ring fast, so hours 0/1 (constants 10/20, poison spike 5000
+        # inside hour 0) have aged OUT of the ring into (sum, max) rows,
+        # and the newest bars (hour 2, 30.0) sit in the buffer. The axis
+        # is [0, seq) = 7400 samples -> 68 buckets (sizes 108/109); hour
+        # rows are HOUR_SAMPLES = 3600 samples wide at interval 1.0, so
+        # every bucket overlapping hour 0's row - buckets 0..33, incl. the
+        # one straddling the hour 0/1 border - takes the row max 5000.0 in
+        # M: full height at the oldest side. Every hour 1/2 bucket (20/30)
+        # lands on the 1-dot floor against the shared peak plot_peak('l')
+        # = 5000.0, which lives ONLY in the hour table (the ring holds
+        # 30.0 only) - the recent 30-unit hour is proportionally shorter.
+        # A on the same scale dilutes hour 0 to its row rate
+        # hour_sum/HOUR_SAMPLES = 40990/3600 ~ 11.39: every bucket
+        # (11.39..30) sits on the 1-dot floor, visibly shorter than M.
+        # 'w' cannot see any of it: its source is the kept buffer, so the
+        # same graph draws only the newest 100 samples (30.0, full on its
+        # own plot_peak('w') = 30.0) - one character, no older traffic.
+        g = bg.Graph(60, interval=1.0, hist_cap=100)
+        for i in range(3600):        # hour 0: 10.0 + one poison spike
+            g.add(5000.0 if i == 150 else 10.0)
+        for _ in range(3600):        # hour 1: 20.0
+            g.add(20.0)
+        for _ in range(200):         # hour 2 (open): 30.0, newest in ring
+            g.add(30.0)
+        self.assertEqual((g.seq, len(g.samples),
+                          g.seq - len(g.samples)),
+                         (7400, 100, 7300))
+        self.assertEqual(max(g.samples), 30.0)    # spike aged out of the ring
+        self.assertEqual(g.plot_peak("l"), 5000.0)  # only the hour table has it
+        c = {"toks": 1, "stat_toks": 2, "dim": 3}
+        scr_m = FakeScreen(10, 41)
+        tui.draw_bar_graph(scr_m, 0, g, 1, 40, "toks", c, period="l", agg="M")
+        scr_a = FakeScreen(10, 41)
+        tui.draw_bar_graph(scr_a, 0, g, 1, 40, "toks", c, period="l", agg="A")
+        plot_m = [t for (yy, x, t, a) in scr_m.writes if yy == 0 and x <= 34]
+        plot_a = [t for (yy, x, t, a) in scr_a.writes if yy == 0 and x <= 34]
+        # M: oldest side full (row max = the 'l' peak), rest on the floor
+        self.assertEqual(plot_m, ["⣀"] * 17 + ["⣿"] * 17)
+        self.assertNotEqual(plot_a, plot_m)  # row-level dilution is visible
+        self.assertEqual(plot_a, ["⣀"] * 34)
+        v_a = g.plot_samples("l", "A", 68)
+        self.assertAlmostEqual(v_a[0], 40990.0 / 3600, places=3)  # row rate
+        # the axis is 'l'-wide: older-than-buffer traffic is visible in 'l'
+        # only, not in 'w'
+        scr_w = FakeScreen(10, 41)
+        tui.draw_bar_graph(scr_w, 0, g, 1, 40, "toks", c, period="w", agg="M")
+        plot_w = [t for (yy, x, t, a) in scr_w.writes if yy == 0 and x <= 34]
+        self.assertNotEqual(plot_m, plot_w)
+        self.assertEqual(plot_w, ["⡇"])   # 'w' draws the 100-sample ring only
+    def test_T8_life_span_label_annotates_the_run_duration(self):
+        # "l" is the one span label that depends on the graph's state: on
+        # the axis rule it renders "this run (x D y H z M)" with duration =
+        # life_count x interval (the L column's sample count), always all
+        # three components, exact spacing. The static labels ("5 minutes"
+        # .. "1 week") are unchanged, and the I7 centering math applies to
+        # the longer label (at width 40 the 34-char plot region holds the
+        # longest realistic label with room to spare).
+        c = {"toks": 1, "stat_toks": 2, "dim": 3}
+
+        def rule(scr):
+            # the full axis-rule rendering in write order: the "─" fill,
+            # the centered span label, the MhHDWL legend
+            return "".join(t for (yy, x, t, a) in scr.writes if yy == 1)
+
+        g = bg.Graph(60, interval=1.0)
+        for _ in range(4500):        # 4500 s = 75 min at a 1 s poll
+            g.add(5.0)
+        self.assertEqual(g.life_count, 4500)
+        scr = FakeScreen(10, 41)
+        tui.draw_bar_graph(scr, 0, g, 1, 40, "toks", c, period="l", agg="M")
+        self.assertEqual(rule(scr), "─" * 34 + "this run (0 D 1 H 15 M)"
+                         + "MhHDWL")
+        lab = [w for w in scr.writes if w[2] == "this run (0 D 1 H 15 M)"]
+        self.assertEqual(len(lab), 1)   # centered like every other span
+        self.assertEqual(lab[0][1], 1 + (34 - len(lab[0][2])) // 2)
+        for _ in range(86880 - 4500):   # 86880 s = 1 d 0 h 8 m
+            g.add(5.0)
+        scr2 = FakeScreen(10, 41)
+        tui.draw_bar_graph(scr2, 0, g, 1, 40, "toks", c, period="l", agg="M")
+        self.assertEqual(rule(scr2), "─" * 34 + "this run (1 D 0 H 8 M)"
+                         + "MhHDWL")
+        # the static span labels are untouched by the annotation
+        scr3 = FakeScreen(10, 41)
+        tui.draw_bar_graph(scr3, 0, g, 1, 40, "toks", c, period="h", agg="M")
+        self.assertIn("30 minutes", rule(scr3))
+
+
 
 
 # --------------------------------------------- A. fetch_metrics label parsing
@@ -1189,6 +1601,508 @@ class TestCalibCache(Base):
         self.assertIn("not valid JSON", err.getvalue())
         j = json.load(open(path))  # the fresh run rewrote the corrupt file
         self.assertEqual(j["url"], self.URL)
+
+
+class TestPlotSamples(unittest.TestCase):
+    """Graph.plot_samples: the period/agg selection for the main plots
+    (phase 2 core). n = raw hist tail; m..w = the fixed time axis -
+    int(period/interval) samples cut into exactly `slots` divmod-sized
+    buckets anchored at seq (a young buffer draws a few newest buckets,
+    not a stretched plot); l = the kept buffer until the lifetime table
+    lands in phase 4. Graph.plot_peak: the raw-sample max over the same
+    window - the compressed views' scale reference."""
+
+    def _graph(self, vals, width=40, interval=0.5):
+        g = bg.Graph(width, interval=interval)
+        for v in vals:
+            if v is None:
+                g.add_blank()
+            else:
+                g.add(v)
+        return g
+
+    def test_P1_n_draws_raw_hist_tail_blanks_as_zero(self):
+        g = self._graph([1.0, 2.0, None, 3.0, None], width=10)
+        self.assertEqual(g.plot_samples("n", "A", 100),
+                         [1.0, 2.0, 0.0, 3.0, 0.0])
+        # the agg is ignored for the live period
+        self.assertEqual(g.plot_samples("n", "M", 100),
+                         g.plot_samples("n", "A", 100))
+
+    def test_P2_n_is_shorter_than_slots_without_padding(self):
+        g = self._graph([1.0, 2.0], width=10)
+        self.assertEqual(len(g.plot_samples("n", "A", 64)), 2)
+
+    def test_P3_agg_avg_fixed_axis_full_width_dilution(self):
+        # fixed axis: 'm' is 600 samples at 0.5s, cut into 10 buckets of
+        # width 60 anchored at seq (divmod(600, 10): no remainder). The
+        # 137-sample buffer covers only the newest three: [77,137) and
+        # [17,77) fully, [-43,17) straddling the buffer start.
+        g = self._graph([float(i) for i in range(1, 138)])  # 137 samples
+        out = g.plot_samples("m", "A", 10)
+        self.assertEqual(len(out), 10)
+        self.assertEqual(out[:7], [0.0] * 7)  # older than the kept buffer
+        # A divides by the FULL bucket width: the straddler's 43 implicit
+        # zeros dilute it (153/60, not 153/17). All three buckets raw
+        # scan (width < BLK_SAMPLES) and the values are small integers,
+        # so the asserts are exact, no tolerance.
+        self.assertEqual(out, [0.0] * 7
+                         + [sum(range(1, 18)) / 60,
+                            sum(range(18, 78)) / 60,
+                            sum(range(78, 138)) / 60])
+
+    def test_P4_agg_max_exact_and_newest_bucket_last(self):
+        # same fixed axis as P3: M ignores the implicit zeros, so the
+        # straddling bucket reports the max of its 17 existing samples;
+        # the newest bucket (the 137th sample) is last
+        g = self._graph([float(i) for i in range(1, 138)])
+        out = g.plot_samples("m", "M", 10)
+        self.assertEqual(out, [0.0] * 7 + [17.0, 77.0, 137.0])
+    def test_P5_short_buffer_pads_the_oldest_side(self):
+        # 3 samples against the 600-sample 'm' axis, 5 buckets of width
+        # 120: only the newest bucket straddles the buffer start
+        g = self._graph([10.0, 20.0, 30.0])
+        self.assertEqual(g.plot_samples("m", "M", 5),
+                         [0.0, 0.0, 0.0, 0.0, 30.0])
+        # the same bucket's A divides by the full width 120 (117 implicit
+        # zeros), so Avg sits low where Max is tall
+        self.assertEqual(g.plot_samples("m", "A", 5),
+                         [0.0, 0.0, 0.0, 0.0, 60.0 / 120])
+        # slots above the period total: divmod(600, 700) = (0, 600) - the
+        # newest 600 buckets are one sample wide, the oldest 100 empty
+        for agg in "AM":
+            self.assertEqual(g.plot_samples("m", agg, 700),
+                             [0.0] * 697 + [10.0, 20.0, 30.0])
+    def test_P6_period_span_mapping_m_and_H(self):
+        g = self._graph([float(i) for i in range(1, 701)])  # 700 samples
+        # 'm': 300 s / 0.5 s = 600 samples; divmod(600, 700) = (0, 600)
+        # -> one-sample buckets for the kept tail, oldest 100 empty
+        out_m = g.plot_samples("m", "M", 700)
+        self.assertEqual(out_m, [0.0] * 100 + [float(i) for i in range(101, 701)])
+        # 'H': 7200-sample axis, 700 buckets -> divmod(7200, 700): 500
+        # buckets of width 10 + the newest 200 of width 11. The 700-
+        # sample buffer fills the newest 63 buckets and bucket 636
+        # straddles the buffer start (width 11, only 7 samples exist).
+        self.assertEqual(g.plot_samples("H", "M", 700),
+                         [0.0] * 636 + [7.0]
+                         + [18.0 + 11.0 * i for i in range(63)])
+        # A: the straddler divides its 28 by the full width 11; the full
+        # buckets are exact means of their 11 samples
+        self.assertEqual(g.plot_samples("H", "A", 700),
+                         [0.0] * 636 + [28.0 / 11.0]
+                         + [13.0 + 11.0 * i for i in range(63)])
+    def test_P7_l_selects_the_whole_run(self):
+        # 137 samples, no trims: the lifetime table is empty and 'l' is
+        # the w-style aggregation of the WHOLE RUN (divmod(seq, slots))
+        # - divmod(137, 24) = (5, 17) - not the 'w' window, which
+        # stretches to the one-week span (one huge bucket + empty ones)
+        g = self._graph([float(i) for i in range(1, 138)])
+        self.assertEqual(g.plot_samples("l", "A", 24),
+                         [3.0, 8.0, 13.0, 18.0, 23.0, 28.0, 33.0]
+                         + [38.5 + 6.0 * i for i in range(17)])
+        self.assertEqual(g.plot_samples("l", "M", 24),
+                         [5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0]
+                         + [41.0 + 6.0 * i for i in range(17)])
+
+    def test_P8_empty_buffer(self):
+        g = bg.Graph(10)
+        self.assertEqual(g.plot_samples("n", "A", 16), [])
+        self.assertEqual(g.plot_samples("m", "A", 16), [0.0] * 16)
+        self.assertEqual(g.plot_samples("w", "M", 16), [0.0] * 16)
+
+    def test_P9_pure_no_state_mutation(self):
+        g = self._graph([float(i % 7) for i in range(200)] + [None] * 5, width=64)
+        snap = lambda: (list(g.hist), g.samples.tobytes(), list(g.blk_s),
+                        list(g.blk_m), g.blk_first, g.seq, g.life_sum,
+                        g.life_count, g.life_max)
+        before = snap()
+        for w in "nmhHdwl":
+            for p in "AM":
+                g.plot_samples(w, p, 33)
+            g.plot_peak(w)
+        self.assertEqual(before, snap())
+        # the returned list is a fresh object: mutating it leaves the graph alone
+        r = g.plot_samples("w", "A", 33)
+        r[0] = 999.0
+        self.assertEqual(before, snap())
+
+    def test_P10_full_block_rows_flow_through_the_tables(self):
+        # 3072 samples = exactly three 1024-sample block rows. The 'h'
+        # axis is 3600 samples (> the buffer), so the 3 buckets are each
+        # 1200 wide, anchored at seq: bucket 2 [1872,3072) = full block
+        # row 2 [2048,3072) + left edge [1872,2048) - the table-driven
+        # path; bucket 1 [672,1872) spans two partial rows (raw scan);
+        # bucket 0 [-528,672) straddles the buffer start and dilutes A
+        # over its full width 1200 (528 implicit zeros).
+        vals = [float((r + 1) * 1000 + (i % 37))
+                for r in range(3) for i in range(1024)]
+        g = self._graph(vals, width=16)
+        # A: every value is a small integer, so the float64 table sums
+        # are exact and equal the direct-scan sums bit-for-bit
+        self.assertEqual(g.plot_samples("h", "A", 3),
+                         [sum(vals[0:672]) / 1200,
+                          sum(vals[672:1872]) / 1200,
+                          sum(vals[1872:3072]) / 1200])
+        # M: bucket 2's max comes from the exact float32 row-max table
+        self.assertEqual(g.plot_samples("h", "M", 3),
+                         [1036.0, 2036.0, 3036.0])
+    def test_P11_live_path_ignores_slots(self):
+        # the live period returns the entire hist; slots smaller than the
+        # hist (even 0) do not truncate here - truncation to the last
+        # slots samples and the plot-width bound happen in draw_bar_graph
+        g = self._graph([1.0, 2.0, 3.0, 4.0, 5.0], width=10)
+        self.assertEqual(g.plot_samples("n", "A", 3),
+                         [1.0, 2.0, 3.0, 4.0, 5.0])
+        self.assertEqual(g.plot_samples("n", "A", 0),
+                         [1.0, 2.0, 3.0, 4.0, 5.0])
+
+    def test_P12_live_path_reflects_the_hist_width_cap(self):
+        # hist is a deque capped at width: the live path sees exactly the
+        # last width samples, whatever slots says
+        g = self._graph([float(i) for i in range(1, 16)], width=10)
+        self.assertEqual(g.plot_samples("n", "A", 100),
+                         [float(i) for i in range(6, 16)])
+
+    def test_P13_blanks_fill_hist_and_samples_neither_none(self):
+        # add_blank: the hist gets None, the samples buffer gets 0.0 -
+        # the live path draws the blank; a compressed bucket aggregates
+        # it as 0.0 and divides by its full width (never a None)
+        g = self._graph([1.0, None, 3.0], width=10)
+        self.assertEqual(list(g.samples), [1.0, 0.0, 3.0])
+        self.assertEqual(g.plot_samples("n", "A", 10), [1.0, 0.0, 3.0])
+        self.assertEqual(g.plot_samples("m", "M", 3), [0.0, 0.0, 3.0])
+        self.assertEqual(g.plot_samples("m", "A", 3),
+                         [0.0, 0.0, 4.0 / 200])  # (1+0+3) over width 200
+        # add(None): the hist only - the samples buffer never sees it,
+        # and the straddling bucket aggregates the 2 existing samples
+        g2 = bg.Graph(10)
+        g2.add(1.0)
+        g2.add(None)
+        g2.add(3.0)
+        self.assertEqual(len(g2.samples), 2)
+        self.assertEqual(g2.plot_samples("m", "M", 3), [0.0, 0.0, 3.0])
+        self.assertEqual(g2.plot_samples("m", "A", 3),
+                         [0.0, 0.0, 4.0 / 200])
+    def test_P14_compressed_slots_zero_draws_nothing(self):
+        g = self._graph([1.0, 2.0])
+        self.assertEqual(g.plot_samples("m", "A", 0), [])
+        self.assertEqual(g.plot_samples("w", "M", 0), [])
+
+    def test_P15_unknown_period_key_raises(self):
+        g = self._graph([1.0])
+        for key in ("x", "M"):  # periods are lowercase; M is an agg key
+            with self.assertRaises(KeyError):
+                g.plot_samples(key, "A", 10)
+
+    def test_P16_full_block_row_plus_right_edge(self):
+        # 1500 samples @1s: the 'h' window is 1800 samples - the single
+        # bucket is [-300,1500): straddling the buffer start, full block
+        # row 0 [0,1024) + right edge [1024,1500) - the aligned-start
+        # boundary (no left edge). A divides by the full width 1800, so
+        # the 300 implicit zeros dilute it (624.58, not 749.5)
+        g = self._graph([float(i) for i in range(1500)], interval=1.0)
+        self.assertEqual(g.plot_samples("h", "A", 1),
+                         [sum(range(1500)) / 1800])
+        self.assertEqual(g.plot_samples("h", "M", 1), [1499.0])
+    def test_P17_full_block_row_plus_left_edge(self):
+        # 2048 samples @1s: the 'h' tail [248,2048) is full block row 1
+        # [1024,2048) + left edge [248,1024) - the aligned-end boundary
+        # (a1 == block boundary: no right edge)
+        g = self._graph([float(i) for i in range(2048)], interval=1.0)
+        self.assertEqual(g.plot_samples("h", "A", 1),
+                         [sum(range(248, 2048)) / 1800])  # 1147.5
+        self.assertEqual(g.plot_samples("h", "M", 1), [2047.0])
+
+    def test_P18_full_block_row_plus_both_edges(self):
+        # 4200 samples @1s: the 'h' tail [2400,4200) is full block row 3
+        # [3072,4096) + both partial edges - the fully table-driven path
+        g = self._graph([float(i) for i in range(4200)], interval=1.0)
+        self.assertEqual(g.plot_samples("h", "A", 1),
+                         [sum(range(2400, 4200)) / 1800])  # 3299.5
+        self.assertEqual(g.plot_samples("h", "M", 1), [4199.0])
+
+    def test_P19_bucket_straddling_two_partial_blocks_raw_scans(self):
+        # 3048 samples @1s, slots=2: bucket 0 [1248,2148) covers partial
+        # block 1 + partial block 2 - no fully covered row, so it raw
+        # scans even though it spans more than one block (the documented
+        # rare two-partial case); bucket 1 [2148,3048) is one partial
+        g = self._graph([float(i) for i in range(3048)], interval=1.0)
+        self.assertEqual(g.plot_samples("h", "A", 2),
+                         [sum(range(1248, 2148)) / 900,
+                          sum(range(2148, 3048)) / 900])   # 1697.5/2597.5
+        self.assertEqual(g.plot_samples("h", "M", 2), [2147.0, 3047.0])
+
+    def test_P20_unaligned_trim_keeps_partial_head_row_out_of_the_tables(self):
+        # 5032 samples @150s: the one-week cap (4032) trims mid-block,
+        # keeping the stale partial head row 0 in the tables. Block 0
+        # holds 1e7 poison values that left the buffer: any read of row 0
+        # (a r0 below the trim) would inflate A ~1000x and set M to 1e7.
+        vals = [1e7] * 1000 + [float(i) for i in range(1000, 5032)]
+        g = self._graph(vals, interval=150.0)
+        self.assertEqual(g.seq, 5032)
+        self.assertEqual(len(g.samples), 4032)   # trimmed to the week cap
+        self.assertEqual(g.blk_first, 0)         # unaligned trim keeps row 0
+        self.assertEqual(g.plot_samples("w", "A", 1),
+                         [sum(range(1000, 5032)) / 4032])  # 3015.5
+        self.assertEqual(g.plot_samples("w", "M", 1), [5031.0])
+
+    def test_P21_aligned_trim_drops_the_head_row(self):
+        # 5056 samples @150s: the trim lands exactly on a block boundary,
+        # deleting row 0 from the tables (blk_first advances) - the bucket
+        # then starts its full rows right at the trim
+        vals = [1e7] * 1024 + [float(i) for i in range(1024, 5056)]
+        g = self._graph(vals, interval=150.0)
+        self.assertEqual(len(g.samples), 4032)
+        self.assertEqual(g.blk_first, 1)         # aligned trim dropped row 0
+        self.assertEqual(g.plot_samples("w", "A", 1),
+                         [sum(range(1024, 5056)) / 4032])  # 3039.5
+        self.assertEqual(g.plot_samples("w", "M", 1), [5055.0])
+
+    def test_P22_young_buffer_draws_a_single_newest_bucket(self):
+        # one minute of data (120 samples @0.5s) against the 'd' axis
+        # (172800 samples): divmod(172800, 228) = (757, 204) - the
+        # 228-bucket view holds 204 buckets of width 758 + 24 of width
+        # 757. Only the newest bucket straddles the buffer start, so
+        # exactly one bar is nonzero - a young buffer no longer draws a
+        # stretched full-width plot
+        g = self._graph([1500.0] * 100 + [3000.0] * 20, width=120)
+        self.assertEqual(g.plot_samples("d", "M", 228),
+                         [0.0] * 227 + [3000.0])
+        # the straddling bucket's A divides by its FULL width 758:
+        # (100x1500 + 20x3000) / 758
+        self.assertEqual(g.plot_samples("d", "A", 228),
+                         [0.0] * 227 + [210000.0 / 758])
+
+    def test_P23_straddling_bucket_A_dilutes_M_does_not(self):
+        # 250 samples of 10.0 against the 600-sample 'm' axis, 2 buckets
+        # of width 300: the newest bucket is [-50,250) - A divides 2500
+        # by 300 (50 implicit zeros), M takes the max of the 250
+        # existing samples
+        g = self._graph([10.0] * 250)
+        self.assertEqual(g.plot_samples("m", "M", 2), [0.0, 10.0])
+        self.assertEqual(g.plot_samples("m", "A", 2),
+                         [0.0, 2500.0 / 300])
+
+    def test_P24_bucket_widths_are_buffer_length_independent(self):
+        # the same (period, interval, slots) gives the same bucket width
+        # whatever the buffer length: 100 vs 3000 samples of 5.0 @0.5s,
+        # 'd' axis (172800), 100 buckets of width 1728. The long buffer
+        # fills the newest bucket [1272,3000) completely; its bucket 98
+        # straddles with 1272 of its 1728 width, the short buffer's
+        # newest bucket straddles with 100
+        gs = self._graph([5.0] * 100)
+        gl = self._graph([5.0] * 3000)
+        self.assertEqual(gl.plot_samples("d", "A", 100),
+                         [0.0] * 98 + [5.0 * 1272 / 1728, 5.0])
+        self.assertEqual(gs.plot_samples("d", "A", 100),
+                         [0.0] * 99 + [5.0 * 100 / 1728])
+        # same 1728 width: the long buffer's newest bucket is full (5.0)
+        # while the short buffer's newest bucket is diluted over it
+        self.assertEqual(gl.plot_samples("d", "M", 100),
+                         [0.0] * 98 + [5.0, 5.0])
+        self.assertEqual(gs.plot_samples("d", "M", 100),
+                         [0.0] * 99 + [5.0])
+
+    def test_P25_samples_older_than_the_window_leave_every_bucket(self):
+        # 5000 samples @1s with a 9999 spike in the oldest 100: the 'h'
+        # window is [3200,5000) (18 buckets of width 100) - the spike
+        # sits in the buffer but older than the window, so no bucket may
+        # see it
+        vals = [9999.0] * 100 + [float(i) for i in range(100, 5000)]
+        g = self._graph(vals, interval=1.0)
+        out_m = g.plot_samples("h", "M", 18)
+        self.assertEqual(out_m, [3299.0 + 100.0 * k for k in range(18)])
+        self.assertNotIn(9999.0, out_m)
+        self.assertEqual(g.plot_samples("h", "A", 18),
+                         [3249.5 + 100.0 * k for k in range(18)])
+
+    def test_P26_plot_peak_exact_maxes_and_edges(self):
+        # plot_peak = the raw sample max over the same fixed window: the
+        # compressed views' scale reference (shared by both aggs)
+        g = self._graph([1.0, None, 3.0], width=10)
+        self.assertEqual(g.plot_peak("n"), 3.0)  # blanks count as 0.0
+        self.assertEqual(self._graph([None, None], width=10).plot_peak("n"),
+                         0.0)  # all-blank hist
+        empty = bg.Graph(10)
+        self.assertEqual(empty.plot_peak("n"), 0.0)
+        self.assertEqual(empty.plot_peak("w"), 0.0)  # empty buffer
+        # 'h' window [2400,4200): the 9999 spike in the oldest 100
+        # samples is outside the window
+        g = self._graph([9999.0] * 100 + [float(i) for i in range(100, 4200)],
+                        interval=1.0)
+        self.assertEqual(g.plot_peak("h"), 4199.0)
+        # buffer shorter than the window: the whole buffer is the window
+        g = self._graph([float(i) for i in range(300)])
+        self.assertEqual(g.plot_peak("d"), 299.0)
+        # l falls back to w until the lifetime table lands in phase 4
+        self.assertEqual(g.plot_peak("l"), g.plot_peak("w"))
+        # unaligned week trim (P20 mirror): the 1e7 poison head row stays
+        # in the tables but is excluded from the window
+        vals = [1e7] * 1000 + [float(i) for i in range(1000, 5032)]
+        self.assertEqual(self._graph(vals, interval=150.0).plot_peak("w"),
+                         5031.0)
+
+
+    def test_P27_trim_folds_dropped_samples_into_hour_rows(self):
+        # phase-4 test knob: a 1000-sample ring at 1s keeps ~1.7 minutes
+        # while the lifetime hour is 3600 samples. Unique per-position
+        # values make any double or lost fold visible; the rows must
+        # exactly equal aggregating the dropped samples per hour.
+        g = bg.Graph(16, interval=1.0, hist_cap=1000)
+        for i in range(8500):
+            g.add(float(i))
+        base = g.seq - len(g.samples)  # 7500
+        H = g.HOUR_SAMPLES            # 3600
+        self.assertEqual(len(g.hour_s), 2)  # hours [0,3600), [3600,7200)
+        for h in range(2):
+            self.assertEqual(g.hour_s[h],
+                             sum(float(i) for i in range(h * H, (h + 1) * H)))
+            self.assertEqual(g.hour_m[h], float((h + 1) * H - 1))
+        # the open head hour: every aged-out sample of [7200, 7500)
+        head = base // H
+        self.assertEqual(g._hour_acc_c, base - head * H)  # 300 samples
+        self.assertEqual(g._hour_acc_s,
+                         sum(float(i) for i in range(head * H, base)))
+        self.assertEqual(g._hour_acc_m, float(base - 1))
+
+    def test_P28_l_plot_exact_over_trims(self):
+        # 3 hours of 1s samples (values constant per hour, one poison
+        # spike per hour) against a 1000-sample ring: rows 0 and 1 are
+        # closed, the head partial [7200, 9800) and the buffer
+        # [9800, 10800) hold hour 2. slots = 3: divmod(10800, 3) cuts
+        # exactly along the hour boundaries, so the assembly is
+        # bit-exact against the reference over ALL samples ever added.
+        g = bg.Graph(16, interval=1.0, hist_cap=1000)
+        H = 3600
+        n = 3 * H
+        all_v = []
+        for i in range(n):
+            v = (9999.0 if i == 100
+                 else 12345.0 if i == n - 1
+                 else 7777.0 if i == 7250
+                 else float(i // H + 1) * 10)
+            g.add(v)
+            all_v.append(v)
+        self.assertEqual(divmod(n, 3), (H, 0))
+        out_a = g.plot_samples("l", "A", 3)
+        out_m = g.plot_samples("l", "M", 3)
+        # reference: sum/max over every sample of each hour
+        self.assertEqual(out_a,
+                         [sum(all_v[h * H:(h + 1) * H]) / H for h in range(3)])
+        self.assertEqual(out_m,
+                         [max(all_v[h * H:(h + 1) * H]) for h in range(3)])
+        # pinned exactly: the pre-buffer spikes (idx 100 in the closed
+        # row 0, 7250 in the head partial) are included exactly once,
+        # via their lifetime cells, and never from the buffer
+        self.assertEqual(out_a, [45989 / 3600, 20.0, 128062 / 3600])
+        self.assertEqual(out_m, [9999.0, 20.0, 12345.0])
+
+    def test_P29_l_peak_reaches_trimmed_history(self):
+        # plot_peak('l') = the max over the visible 'l' axis (slots=None
+        # -> the graph's bar width; these runs are shorter than width
+        # hours, so the whole run is visible): a peak that lives only in
+        # trimmed history is still visible via the hour rows / the open
+        # accumulator, while the kept-buffer views miss it
+        g = bg.Graph(16, interval=1.0, hist_cap=500)
+        for i in range(4500):
+            g.add(99999.0 if i == 100 else float(i % 50))
+        self.assertEqual(g.plot_peak("l"), 99999.0)  # via closed row 0
+        self.assertLess(g.plot_peak("w"), 99999.0)   # the buffer never saw it
+        # peak in the open head partial (aged out of the ring, not yet a row)
+        g = bg.Graph(16, interval=1.0, hist_cap=1000)
+        for i in range(7600):
+            g.add(77777.0 if i == 4000 else float(i % 50))
+        self.assertEqual(g.plot_peak("l"), 77777.0)
+        # empty and all-blank runs
+        self.assertEqual(bg.Graph(10).plot_peak("l"), 0.0)
+        e2 = bg.Graph(16, interval=1.0, hist_cap=100)
+        for _ in range(8000):
+            e2.add_blank()
+        self.assertEqual(e2.plot_peak("l"), 0.0)
+
+    def test_P30_l_plots_are_pure(self):
+        g = bg.Graph(16, interval=1.0, hist_cap=1000)
+        for i in range(8000):
+            g.add(float(i % 11) + (1.0 if i % 3 == 0 else 0.0))
+        snap = lambda: (list(g.hist), g.samples.tobytes(), list(g.blk_s),
+                        list(g.blk_m), g.blk_first, g.seq, g.life_sum,
+                        g.life_count, g.life_max, list(g.hour_s),
+                        list(g.hour_m), g._hour_acc_c, g._hour_acc_s,
+                        g._hour_acc_m, g._hour_acc_h)
+        before = snap()
+        for slots in (1, 3, 50, 3000, 20000):
+            g.plot_samples("l", "A", slots)
+            g.plot_samples("l", "M", slots)
+        g.plot_peak("l")
+        self.assertEqual(before, snap())
+        # plotting twice gives identical lists
+        self.assertEqual(g.plot_samples("l", "A", 50),
+                         g.plot_samples("l", "A", 50))
+        self.assertEqual(g.plot_samples("l", "M", 50),
+                         g.plot_samples("l", "M", 50))
+
+    def test_P31_l_equals_w_style_whole_run_without_trims(self):
+        # no trims: the table is empty and 'l' is the w-style
+        # aggregation of the raw buffer over the WHOLE RUN
+        # (divmod(seq, slots) - the w window would stretch to a week)
+        g = self._graph([float(i % 13) for i in range(2000)], interval=1.0)
+        n = g.seq
+        for slots in (7, 24):
+            per, rem = divmod(n, slots)
+            sizes = [per] * slots
+            for b in range(slots - rem, slots):
+                sizes[b] = per + 1
+            seg = list(g.samples)  # == every sample ever added (no trims)
+            ref_a, ref_m = [], []
+            off = 0
+            for b in range(slots - 1, -1, -1):
+                a1 = n - off
+                off += sizes[b]
+                a0 = a1 - sizes[b]
+                ref_a.insert(0, sum(seg[a0:a1]) / sizes[b])
+                ref_m.insert(0, max(seg[a0:a1]))
+            self.assertEqual(g.plot_samples("l", "A", slots), ref_a)
+            self.assertEqual(g.plot_samples("l", "M", slots), ref_m)
+        # a trimmed graph must NOT equal 'w': the older-than-buffer
+        # buckets become non-zero via the hour table
+        g = bg.Graph(16, interval=1.0, hist_cap=1000)
+        for i in range(10800):
+            g.add(float(i % 7) + 1.0)
+        self.assertNotEqual(g.plot_samples("l", "A", 3), g.plot_samples("w", "A", 3))
+        self.assertNotEqual(g.plot_samples("l", "M", 3), g.plot_samples("w", "M", 3))
+
+    def test_P32_l_buckets_cutting_hours_use_row_level_values(self):
+        # bucket boundaries that cut through lifetime hours: a cut row
+        # contributes width x (row_sum / H) to A and the row max to M
+        # - with values constant per hour (0, 1, 2) the rule is exact
+        # against the per-sample reference
+        g = bg.Graph(16, interval=1.0, hist_cap=100)
+        H = 3600
+        for i in range(8100):
+            g.add(float(i // H))
+        all_v = [float(i // H) for i in range(8100)]
+        out_a = g.plot_samples("l", "A", 10)
+        out_m = g.plot_samples("l", "M", 10)
+        # slots = 10: ten 810-wide buckets, every boundary hour-misaligned
+        per, rem = divmod(8100, 10)
+        self.assertEqual((per, rem), (810, 0))
+        exp_a, exp_m = [], []
+        off = 0
+        for b in range(9, -1, -1):
+            a1 = 8100 - off
+            off += per
+            a0 = a1 - per
+            exp_a.insert(0, sum(all_v[a0:a1]) / per)
+            exp_m.insert(0, max(all_v[a0:a1]))
+        self.assertEqual(out_a, exp_a)
+        self.assertEqual(out_m, exp_m)
+        # pinned: b4 [3240,4050) mixes 360 x 0.0 (row 0) and 450 x 1.0
+        # (row 1); b8 [6480,7290) mixes 720 x 1.0 and 90 x 2.0 (open head)
+        self.assertEqual(out_a[4], 450 / 810)
+        self.assertEqual(out_a[8], 900 / 810)
+        self.assertEqual(out_a, [0.0] * 4 + [450 / 810, 1.0, 1.0, 1.0,
+                                             900 / 810, 2.0])
+        self.assertEqual(out_m, [0.0] * 4 + [1.0, 1.0, 1.0, 1.0, 2.0, 2.0])
 
 
 if __name__ == "__main__":

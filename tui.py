@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 """ninfer_btop tui: the curses screen layer of the dashboard.
 
-Screen composition and display code: frame layout, status line and footer,
-colors/attributes, the MhHDWL period-summary column geometry (STAT_LABEL /
-STAT_COLS), the cache panel's row builders (_xfer_row, _rate_val, _kv_row,
-XFER_COLS), the --text output, and the main_loop event loop.
+Screen composition and display code:
+  - frame layout
+  - status line and footer
+  - colors/attributes
+  - the MhHDWL period-summary column geometry (STAT_LABEL / STAT_COLS)
+  - the cache panel's row builders (_xfer_row, _rate_val, _kv_row,
+    XFER_COLS)
+  - the footer's period/agg selector (selector_segments), the
+    main graphs' per-period plot sourcing (Graph.plot_samples)
+  - the --text output, and the main_loop event loop.
 
 Imports ninfer_engine_state (NinferEngineState, the engine's live state)
 and the two stdlib-only leaves metrics_calib (formatting helpers) and
@@ -153,6 +159,46 @@ def _stat_attr(c, is_peak):
     return curses.color_pair(c.get("dim", 0))
 
 
+# ------------------------------------------------- period/agg selector
+# main_loop key maps -> selection value. One global selection drives all
+# three main graphs (batch, toks, prefill); the xfer graphs always draw
+# their fixed 13-char live window.
+PERIOD_KEYS = {ord(k): k for k in "nmhHdwl"}
+AGG_KEYS = {ord(k): k for k in "AM"}
+PERIOD_LABELS = (("n", "now"), ("m", "5m"), ("h", "30m"), ("H", "1h"),
+                 ("d", "1d"), ("w", "1w"), ("l", "life"))
+AGG_LABELS = (("A", "Avg"), ("M", "Max"))
+# per-plot span label for a selected (non-live) period; the live
+# period keeps the width-derived "N seconds" label
+# span labels for the compressed periods on the axis rule; "l" (this run)
+# is not here - its label is duration-annotated per graph in draw_bar_graph
+SPAN_LABELS = {"m": "5 minutes", "h": "30 minutes", "H": "1 hour",
+               "d": "1 day", "w": "1 week"}
+
+
+def selector_segments(period, agg, c):
+    """Footer period/agg selector: one segment per entry, the active
+    entries underlined.
+
+    Active = A_UNDERLINE with the label pair on color terminals; on the
+    monochrome fallback (c == {}, the make_colors no-color case) it degrades
+    to A_BOLD. Returns a list of (text, attr) segments.
+    """
+    def attr(active):
+        if not active:
+            return curses.color_pair(c.get("dim", 0))
+        if c:
+            return curses.color_pair(c.get("label", 0)) | curses.A_UNDERLINE
+        return curses.A_BOLD
+    segs = [("  period=", attr(False))]
+    for i, (k, lab) in enumerate(PERIOD_LABELS):
+        segs.append((lab if i == 0 else " " + lab, attr(period == k)))
+    segs.append(("  agg fn=", attr(False)))
+    for i, (k, lab) in enumerate(AGG_LABELS):
+        segs.append((lab if i == 0 else " " + lab, attr(agg == k)))
+    return segs
+
+
 def draw_panel(scr, y, title, key, c, width, stats=None):
     """Draw a panel title row.
 
@@ -225,15 +271,43 @@ STAT_COLS = len(STAT_LABEL)
 KEY_ESCAPE = getattr(curses, "KEY_ESCAPE", 27)
 
 
-def draw_bar_graph(scr, y, graph: Graph, rows, width, key, c):
-    hist_vals = list(graph.hist)
-    dots = graph.dots(rows)  # one dot height per sample
+def draw_bar_graph(scr, y, graph: Graph, rows, width, key, c, period=None,
+                   agg="A"):
     # two samples per braille character: the plot is half the buffer wide;
     # the buffer holds oldest -> newest, but the newest sample is on the
     # left, so the window is read newest first
     # the rightmost STAT_COLS columns are reserved for the MhHDWL summaries
-    n = min(len(hist_vals), 2 * (width - STAT_COLS))
-    grid = dots_to_chars(dots[-n:][::-1], rows)
+    slots = 2 * (width - STAT_COLS)
+    if period is None:
+        # no selection: the raw hist tail through graph.dots, exactly as
+        # before the period/agg selection landed (the pre-phase-2 draw)
+        hist_vals = list(graph.hist)
+        dots = graph.dots(rows)  # one dot height per sample
+        n = min(len(hist_vals), slots)
+        grid = dots_to_chars(dots[-n:][::-1], rows)
+    else:
+        # selected period: plot_samples aggregates the raw buffer into exactly
+        # `slots` contiguous buckets (newest last; the oldest side is
+        # zero-padded when the kept buffer is shorter than the span); "n"
+        # is the live hist tail (blanks as 0.0 - the same dots as the raw
+        # path) and may be shorter than slots (partial period, grows left)
+        vals = graph.plot_samples(period, agg, slots)
+        if period == "n":
+            vals = vals[-slots:]
+        n = len(vals)
+        if period != "n" and not graph.pinned:
+            # compressed non-pinned view: scale against the RAW window peak
+            # (plot_peak) - one scale shared by both aggs. M buckets sit on
+            # it, A's diluted bucket averages sit visibly below it, so
+            # switching the agg changes the bar heights. Rescaling to the
+            # plotted max would hide the agg function behind the rescale;
+            # the lifetime peak would freeze ordinary traffic at the 1-dot
+            # floor (one old burst freezes the whole graph)
+            m = graph.plot_peak(period)
+        else:
+            m = graph.dot_scale(rows)
+        dots = compute_dots(vals, max=m, total_dots=4 * rows)
+        grid = dots_to_chars(dots[::-1], rows)
     plot_w = min(width - STAT_COLS, (n + 1) // 2)
     base_attr = curses.color_pair(c.get(key, 0))
     # the newest sample is on the left: the leftmost character holds it and
@@ -280,7 +354,21 @@ def draw_bar_graph(scr, y, graph: Graph, rows, width, key, c):
         scr.addnstr(y + rows, 1, "─" * plot_len, plot_len)
     except curses.error:
         pass
-    span = f"{2 * plot_len * graph.interval:g} seconds"
+    if period is None or period == "n":
+        # live period: the drawn span depends on the terminal width
+        span = f"{2 * plot_len * graph.interval:g} seconds"
+    elif period == "l":
+        # whole run: the axis spans the process life, so annotate how much
+        # that is - lifetime samples (life_count) x the poll interval, in
+        # D/H/M components, always all three
+        dur_s = graph.life_count * graph.interval
+        span = (f"this run ({int(dur_s // 86400)} D "
+                f"{int(dur_s % 86400 // 3600)} H "
+                f"{int(dur_s % 3600 // 60)} M)")
+    else:
+        # compressed period: the selected span (shortened to the kept buffer
+        # by plot_samples when that is shorter)
+        span = SPAN_LABELS[period]
     x = max(1, 1 + (plot_len - len(span)) // 2)
     try:
         scr.addnstr(y + rows, x, span, plot_len - (x - 1),
@@ -350,13 +438,14 @@ def _kv_row(label, val, cap):
     return f"  {label:<9} : {human(val)}{pct}"
 
 
-def frame(scr, eng, graphs, c, calib=None):
+def frame(scr, eng, graphs, c, calib=None, sel=None):
     scr.erase()
     try:
         max_y, max_x = scr.getmaxyx()
     except Exception:
         return
     width = max_x - 1
+    period, agg = sel if sel is not None else ("n", "M")
 
     s = eng.m and eng.last_frame
     model = eng.model or "?"
@@ -461,7 +550,8 @@ def frame(scr, eng, graphs, c, calib=None):
     cur_b = f"{b:.0f}" if b is not None else "—"
     y = draw_panel(scr, y, "Batch size  (ninfer_requests_running)", "batch", c, width,
                    metric_stat_segments(g_batch, cur_b))
-    y = draw_bar_graph(scr, y, g_batch, rows_batch, width, "batch", c)
+    y = draw_bar_graph(scr, y, g_batch, rows_batch, width, "batch", c,
+                   period, agg)
     if s:
         # paused is the one lane number that signals a problem: a live
         # request stalled on a capacity event, so paint it red when non-zero
@@ -490,14 +580,16 @@ def frame(scr, eng, graphs, c, calib=None):
         cur_p = f"{p:,.0f}" if p is not None else "—"
         y = draw_panel(scr, y, "Prefill t/s  (prompt processing)", "toks", c, width,
                        metric_stat_segments(g_pre, cur_p))
-        y = draw_bar_graph(scr, y, g_pre, plot_rows, width, "toks", c)
+        y = draw_bar_graph(scr, y, g_pre, plot_rows, width, "toks", c,
+                   period, agg)
 
     # --- decode tokens/s panel
     t = (s or {}).get("toks_per_s")
     cur_t = f"{t:,.0f}" if t is not None else "—"
     y = draw_panel(scr, y, "Decode t/s  (generation)", "toks", c, width,
                    metric_stat_segments(g_toks, cur_t))
-    y = draw_bar_graph(scr, y, g_toks, plot_rows, width, "toks", c)
+    y = draw_bar_graph(scr, y, g_toks, plot_rows, width, "toks", c,
+                   period, agg)
 
     # --- totals panel
     y = draw_panel(scr, y, "Token totals", "title", c, width)
@@ -597,6 +689,18 @@ def frame(scr, eng, graphs, c, calib=None):
         except curses.error:
             break
         x += n
+    # period/agg selector after the fixed q/util/savings items: those always
+    # fit first, and on a narrow terminal only the selector's tail truncates
+    if sel is not None:
+        for txt, a in selector_segments(sel[0], sel[1], c):
+            n = min(len(txt), width - x - 1)
+            if n <= 0:
+                break
+            try:
+                scr.addnstr(y, x, txt[:n], n, a)
+            except curses.error:
+                break
+            x += n
     scr.refresh()
 
 
@@ -625,6 +729,11 @@ def main_loop(stdscr, args, calib=None):
     eng = NinferEngineState(args.url, interval, args.pricing_rates, label=args.pricing_model)
     last_poll = 0.0
     running = True
+    # global period/agg selection for the three main graphs (the xfer graphs
+    # keep their fixed 13-char live view): n m h H d w l set the period,
+    # A M the aggregation function (avg vs max, compressed periods only)
+    period = "n"
+    agg = "M"
 
     while running:
         now = time.time()
@@ -647,7 +756,7 @@ def main_loop(stdscr, args, calib=None):
             else:
                 for k in graphs:
                     graphs[k].add_blank()
-            frame(stdscr, eng, graphs, c, calib)
+            frame(stdscr, eng, graphs, c, calib, (period, agg))
 
         # resync graph width on terminal resize
         ny, nx = stdscr.getmaxyx()
@@ -660,7 +769,7 @@ def main_loop(stdscr, args, calib=None):
                 g2.hist.extend(old[-2 * gwidth:])
                 g2.adopt_history(graphs[k])  # raw history + L aggregates
                 graphs[k] = g2
-            frame(stdscr, eng, graphs, c, calib)
+            frame(stdscr, eng, graphs, c, calib, (period, agg))
 
         ch = stdscr.getch()
         if ch == -1:
@@ -669,6 +778,12 @@ def main_loop(stdscr, args, calib=None):
             continue
         if ch in (ord("q"), ord("Q"), KEY_ESCAPE):
             running = False
+        elif ch in PERIOD_KEYS:
+            period = PERIOD_KEYS[ch]
+            frame(stdscr, eng, graphs, c, calib, (period, agg))
+        elif ch in AGG_KEYS:
+            agg = AGG_KEYS[ch]
+            frame(stdscr, eng, graphs, c, calib, (period, agg))
 
     return 0
 
