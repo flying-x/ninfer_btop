@@ -314,10 +314,10 @@ class TestPlotSamplesWiring(Base):
 
     def _spiky_graph(self):
         """4600 samples @0.5s: 1000 zeros, then a 30-minute region holding
-        one 10.0 spike every 50 samples - every 52/53-sample 'h' bucket
-        contains a spike, so the window max is 10.0, the same as the
-        lifetime peak (the scale choice cannot be seen from this graph;
-        test_T4 drives that distinction).
+        one 10.0 spike every 50 samples - every 52-sample lifetime-
+        anchored 'h' lattice bin contains a spike (50 < 52), so the window
+        max is 10.0, the same as the lifetime peak (the scale choice
+        cannot be seen from this graph; test_T4 drives that distinction).
         """
         g = bg.Graph(60, interval=0.5)
         for _ in range(1000):
@@ -335,9 +335,14 @@ class TestPlotSamplesWiring(Base):
         return scr
 
     def test_T1_compressed_frame_agg_max_draws_full_buckets(self):
+        # lattice-anchored bins (W = 3600//68 = 52, anchored at sample 0):
+        # every view bin 21..88 holds a spike (50 < 52) and draws full,
+        # except the newest bin [4576, 4600) - only 24 samples in since
+        # the last spike (4550) - so the leftmost character pairs that
+        # empty partial bin (0 dots) with its full neighbor.
         scr = self._frame("M")
         plot = [t for (yy, x, t, a) in scr.writes if yy == 0 and x <= 34]
-        self.assertEqual(plot, ["⣿"] * 34)
+        self.assertEqual(plot, ["⢸"] + ["⣿"] * 33)
         base = "".join(t for (yy, x, t, a) in scr.writes if yy == 1)
         self.assertIn("30 minutes", base)   # the real selected span
         self.assertIn("MhHDWL", base)       # period columns untouched
@@ -345,28 +350,32 @@ class TestPlotSamplesWiring(Base):
     def test_T2_agg_avg_measures_against_the_raw_window_peak(self):
         # the A-agg view scales against the RAW window peak
         # (plot_peak = 10.0, the spike) - the same scale T1's M view uses,
-        # not the plotted max. The diluted bucket averages (~0.19) sit on
-        # the 1-dot floor: that floor is the dilution, visible against
+        # not the plotted max. The diluted bin averages (10/52 ~ 0.19) sit
+        # on the 1-dot floor: that floor is the dilution, visible against
         # T1's full M bars (switching Avg<->Max changes the bar heights).
+        # The newest lattice bin [4576, 4600) is all zeros -> 0 dots, so
+        # the leftmost character pairs that with its neighbor's floor dot.
         scr = self._frame("A")
         plot = [t for (yy, x, t, a) in scr.writes if yy == 0 and x <= 34]
-        self.assertEqual(plot, ["⣀"] * 34)         # 1 dot per bucket
+        self.assertEqual(plot, ["⢀"] + ["⣀"] * 33)  # 1 dot per bin
         g = self._spiky_graph()
         self.assertEqual(g.plot_peak("h"), 10.0)    # the shared scale
         vals = g.plot_samples("h", "A", 68)
-        self.assertEqual(set(bg.compute_dots(vals,
-                                             max=g.plot_peak("h"),
-                                             total_dots=4)),
-                         {1})  # every diluted bucket lands on the floor
+        dots = bg.compute_dots(vals, max=g.plot_peak("h"), total_dots=4)
+        self.assertEqual(set(dots[:-1]), {1})  # every full bin lands on the floor
+        self.assertEqual(dots[-1], 0)          # the zero run-tail partial bin
 
     def test_T4_burst_outside_the_window_is_excluded_from_the_scale(self):
         """6.1k samples @0.5s: a 3000.0 burst older than the 30-minute
-        window, steady 100/300 traffic inside it. The scale is the raw
-        WINDOW peak (plot_peak = 300): the burst outside the window is
-        excluded from it, so the steady traffic keeps its full 2-4 dot
-        range; scaled to the lifetime peak (3000) every steady bucket
-        would land on the 1-dot floor (the frozen line a past burst left
-        behind).
+        lattice view (bins 50..117, W = 52 anchored at sample 0; the
+        burst sits in bins 38-40), steady 100/300 traffic inside it.
+        The scale is the raw WINDOW peak (plot_peak = 300): the burst
+        outside the view is excluded from it, so the steady traffic keeps
+        its 2-4 dot range; scaled to the lifetime peak (3000) every
+        steady bin would land on the 1-dot floor (the frozen line a past
+        burst left behind). Boundary bins dilute to 3 dots, the 16-sample
+        run tail [6084, 6100) shows the 1-dot floor, the rest hold 2 (100)
+        or 4 (300).
         """
         g = bg.Graph(60, interval=0.5)
         def chunk(n, off=0):
@@ -382,10 +391,11 @@ class TestPlotSamplesWiring(Base):
         plot = [t for (yy, x, t, a) in scr.writes if yy == 0 and x <= 34]
         self.assertEqual(g.plot_peak("h"), 300.0)  # burst outside: excluded
         self.assertEqual(plot,
-                         ["⣤"] * 2 + ["⣾"] + ["⣿"] * 4 + ["⣤"] * 4
-                         + ["⣴"] + ["⣿"] * 4 + ["⣧"] + ["⣤"] * 4
-                         + ["⣾"] + ["⣿"] * 4 + ["⣤"] * 4 + ["⣼"]
-                         + ["⣿"] * 3)
+                         ["⣠", "⣤", "⣴", "⣿", "⣿", "⣿", "⣿", "⣧",
+                          "⣤", "⣤", "⣤", "⣤", "⣾", "⣿", "⣿", "⣿",
+                          "⣿", "⣦", "⣤", "⣤", "⣤", "⣤", "⣿", "⣿",
+                          "⣿", "⣿", "⣷", "⣤", "⣤", "⣤", "⣤", "⣼",
+                          "⣿", "⣿"])
         self.assertGreater(len(set(plot)), 1)      # not a flat line
         self.assertNotIn("⣀", plot)                # no 1-dot floor
         vals = g.plot_samples("h", "A", 68)
@@ -1605,12 +1615,16 @@ class TestCalibCache(Base):
 
 class TestPlotSamples(unittest.TestCase):
     """Graph.plot_samples: the period/agg selection for the main plots
-    (phase 2 core). n = raw hist tail; m..w = the fixed time axis -
-    int(period/interval) samples cut into exactly `slots` divmod-sized
-    buckets anchored at seq (a young buffer draws a few newest buckets,
-    not a stretched plot); l = the kept buffer until the lifetime table
-    lands in phase 4. Graph.plot_peak: the raw-sample max over the same
-    window - the compressed views' scale reference."""
+    (phase 2 core, lattice per amendment 5). n = raw hist tail;
+    m..w = fixed bins lifetime-anchored: W = max(1, total // slots)
+    with total = int(period/interval) samples, bin j = [j*W, (j+1)*W)
+    anchored at sample 0 - a constant per (period, interval); the view
+    is the newest `slots` bins, closed bins never change (freeze-then-
+    jump: the axis steps right one column when seq crosses a bin edge);
+    l = the whole run over its own lattice (W = max(1, ceil(seq/slots)),
+    re-cut when the width changes) plus the lifetime hour table.
+    Graph.plot_peak: the raw-sample max over the same bin ranges - the
+    compressed views' scale reference."""
 
     def _graph(self, vals, width=40, interval=0.5):
         g = bg.Graph(width, interval=interval)
@@ -1634,75 +1648,81 @@ class TestPlotSamples(unittest.TestCase):
         self.assertEqual(len(g.plot_samples("n", "A", 64)), 2)
 
     def test_P3_agg_avg_fixed_axis_full_width_dilution(self):
-        # fixed axis: 'm' is 600 samples at 0.5s, cut into 10 buckets of
-        # width 60 anchored at seq (divmod(600, 10): no remainder). The
-        # 137-sample buffer covers only the newest three: [77,137) and
-        # [17,77) fully, [-43,17) straddling the buffer start.
+        # lattice: 'm' is 600 samples at 0.5s -> W = 600 // 10 = 60
+        # (constant, anchored at sample 0). The 137-sample run covers
+        # only the newest three bins: [120,137) of bin 2, [60,120) and
+        # [0,60) - nothing older exists, bins j < 0 render 0.0.
         g = self._graph([float(i) for i in range(1, 138)])  # 137 samples
         out = g.plot_samples("m", "A", 10)
         self.assertEqual(len(out), 10)
-        self.assertEqual(out[:7], [0.0] * 7)  # older than the kept buffer
-        # A divides by the FULL bucket width: the straddler's 43 implicit
-        # zeros dilute it (153/60, not 153/17). All three buckets raw
-        # scan (width < BLK_SAMPLES) and the values are small integers,
-        # so the asserts are exact, no tolerance.
+        self.assertEqual(out[:7], [0.0] * 7)  # before the run start
+        # A divides by the FULL bin width W: bin 2's 43 implicit zeros
+        # dilute it (2193/60, not 2193/17). All three bins raw-scan
+        # (width < BLK_SAMPLES) and the values are small integers, so
+        # the asserts are exact, no tolerance.
         self.assertEqual(out, [0.0] * 7
-                         + [sum(range(1, 18)) / 60,
-                            sum(range(18, 78)) / 60,
-                            sum(range(78, 138)) / 60])
+                         + [sum(range(1, 61)) / 60,
+                            sum(range(61, 121)) / 60,
+                            sum(range(121, 138)) / 60])
 
     def test_P4_agg_max_exact_and_newest_bucket_last(self):
-        # same fixed axis as P3: M ignores the implicit zeros, so the
-        # straddling bucket reports the max of its 17 existing samples;
-        # the newest bucket (the 137th sample) is last
+        # same lattice as P3: M ignores the implicit zeros, so bin 2
+        # reports the max of its 17 existing samples; the newest bin
+        # (holding the 137th sample) is last
         g = self._graph([float(i) for i in range(1, 138)])
         out = g.plot_samples("m", "M", 10)
-        self.assertEqual(out, [0.0] * 7 + [17.0, 77.0, 137.0])
+        self.assertEqual(out, [0.0] * 7 + [60.0, 120.0, 137.0])
     def test_P5_short_buffer_pads_the_oldest_side(self):
-        # 3 samples against the 600-sample 'm' axis, 5 buckets of width
-        # 120: only the newest bucket straddles the buffer start
+        # 3 samples against the 'm' lattice (W = 600 // 5 = 120,
+        # anchored at sample 0): only the newest bin [0,120) holds
+        # samples
         g = self._graph([10.0, 20.0, 30.0])
         self.assertEqual(g.plot_samples("m", "M", 5),
                          [0.0, 0.0, 0.0, 0.0, 30.0])
-        # the same bucket's A divides by the full width 120 (117 implicit
+        # the same bin's A divides by the full width 120 (117 implicit
         # zeros), so Avg sits low where Max is tall
         self.assertEqual(g.plot_samples("m", "A", 5),
                          [0.0, 0.0, 0.0, 0.0, 60.0 / 120])
-        # slots above the period total: divmod(600, 700) = (0, 600) - the
-        # newest 600 buckets are one sample wide, the oldest 100 empty
+        # slots above the period total: W = max(1, 600 // 700) = 1 -
+        # one sample per bin, the newest 3 bins hold the samples, the
+        # oldest 697 bins are before the run
         for agg in "AM":
             self.assertEqual(g.plot_samples("m", agg, 700),
                              [0.0] * 697 + [10.0, 20.0, 30.0])
     def test_P6_period_span_mapping_m_and_H(self):
         g = self._graph([float(i) for i in range(1, 701)])  # 700 samples
-        # 'm': 300 s / 0.5 s = 600 samples; divmod(600, 700) = (0, 600)
-        # -> one-sample buckets for the kept tail, oldest 100 empty
+        # 'm': 300 s / 0.5 s = 600 samples; W = max(1, 600 // 700) = 1 -
+        # one sample per bin, so every one of the 700 shown bins holds
+        # exactly the sample at its index (nothing is empty: the run is
+        # 700 samples long)
         out_m = g.plot_samples("m", "M", 700)
-        self.assertEqual(out_m, [0.0] * 100 + [float(i) for i in range(101, 701)])
-        # 'H': 7200-sample axis, 700 buckets -> divmod(7200, 700): 500
-        # buckets of width 10 + the newest 200 of width 11. The 700-
-        # sample buffer fills the newest 63 buckets and bucket 636
-        # straddles the buffer start (width 11, only 7 samples exist).
+        self.assertEqual(out_m, [float(i) for i in range(1, 701)])
+        # 'H': 3600 s / 0.5 s = 7200 samples -> W = 7200 // 700 = 10,
+        # anchored at sample 0: the run fills the newest 70 bins
+        # (j = 0..69) and the oldest 630 shown bins are before the run
         self.assertEqual(g.plot_samples("H", "M", 700),
-                         [0.0] * 636 + [7.0]
-                         + [18.0 + 11.0 * i for i in range(63)])
-        # A: the straddler divides its 28 by the full width 11; the full
-        # buckets are exact means of their 11 samples
+                         [0.0] * 630
+                         + [10.0 * i for i in range(1, 71)])
+        # A: every bin is full (10 samples each, the last exactly
+        # 10), so the bins are exact means: 10j + 5.5
         self.assertEqual(g.plot_samples("H", "A", 700),
-                         [0.0] * 636 + [28.0 / 11.0]
-                         + [13.0 + 11.0 * i for i in range(63)])
+                         [0.0] * 630
+                         + [10.0 * j + 5.5 for j in range(70)])
     def test_P7_l_selects_the_whole_run(self):
-        # 137 samples, no trims: the lifetime table is empty and 'l' is
-        # the w-style aggregation of the WHOLE RUN (divmod(seq, slots))
-        # - divmod(137, 24) = (5, 17) - not the 'w' window, which
-        # stretches to the one-week span (one huge bucket + empty ones)
+        # 137 samples, no trims: 'l' uses its own lattice, W = max(1,
+        # ceil(137/24)) = 6, anchored at sample 0. The run fills the
+        # newest 23 bins (j = 0..22); the oldest shown bin (j = -1) is
+        # before the run -> 0.0. Bins 0..21 are full 6-sample bins;
+        # bin 22 = [132,137) holds 5 of its 6 samples and A divides by
+        # the FULL width (675/6 = 112.5, dilution), M ignores the
+        # implicit zero. Not the 'w' view, which stretches to a week.
         g = self._graph([float(i) for i in range(1, 138)])
         self.assertEqual(g.plot_samples("l", "A", 24),
-                         [3.0, 8.0, 13.0, 18.0, 23.0, 28.0, 33.0]
-                         + [38.5 + 6.0 * i for i in range(17)])
+                         [0.0] + [3.5 + 6.0 * j for j in range(22)]
+                         + [sum(range(133, 138)) / 6])
         self.assertEqual(g.plot_samples("l", "M", 24),
-                         [5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0]
-                         + [41.0 + 6.0 * i for i in range(17)])
+                         [0.0] + [6.0 * (j + 1) for j in range(22)]
+                         + [137.0])
 
     def test_P8_empty_buffer(self):
         g = bg.Graph(10)
@@ -1727,25 +1747,28 @@ class TestPlotSamples(unittest.TestCase):
         self.assertEqual(before, snap())
 
     def test_P10_full_block_rows_flow_through_the_tables(self):
-        # 3072 samples = exactly three 1024-sample block rows. The 'h'
-        # axis is 3600 samples (> the buffer), so the 3 buckets are each
-        # 1200 wide, anchored at seq: bucket 2 [1872,3072) = full block
-        # row 2 [2048,3072) + left edge [1872,2048) - the table-driven
-        # path; bucket 1 [672,1872) spans two partial rows (raw scan);
-        # bucket 0 [-528,672) straddles the buffer start and dilutes A
-        # over its full width 1200 (528 implicit zeros).
+        # 8192 samples = exactly eight 1024-sample block rows. 'h' is
+        # 1800 s / 0.5 s = 3600 samples -> W = 3600 // 3 = 1200,
+        # anchored at sample 0: the shown bins are j = 4..6. Bin 5
+        # [6000,7200) contains full block row 6 [6144,7168) with both
+        # raw edges - the table-driven path (A via exact float64 block
+        # sums, M via the exact float32 row max); bins 4 and 6 straddle
+        # two partial rows and raw-scan (the documented rare case).
         vals = [float((r + 1) * 1000 + (i % 37))
-                for r in range(3) for i in range(1024)]
+                for r in range(8) for i in range(1024)]
         g = self._graph(vals, width=16)
         # A: every value is a small integer, so the float64 table sums
         # are exact and equal the direct-scan sums bit-for-bit
         self.assertEqual(g.plot_samples("h", "A", 3),
-                         [sum(vals[0:672]) / 1200,
-                          sum(vals[672:1872]) / 1200,
-                          sum(vals[1872:3072]) / 1200])
-        # M: bucket 2's max comes from the exact float32 row-max table
+                         [sum(vals[4800:6000]) / 1200,
+                          sum(vals[6000:7200]) / 1200,
+                          sum(vals[7200:8192]) / 1200])
+        # M: bin 5's right edge [7168,7200) is the HEAD OF ROW 7 (row
+        # r covers [1024r, 1024(r+1))), whose 8000-based values beat
+        # its row-6 max; the other bins take the max of the rows they
+        # reach
         self.assertEqual(g.plot_samples("h", "M", 3),
-                         [1036.0, 2036.0, 3036.0])
+                         [6036.0, 8031.0, 8036.0])
     def test_P11_live_path_ignores_slots(self):
         # the live period returns the entire hist; slots smaller than the
         # hist (even 0) do not truncate here - truncation to the last
@@ -1795,109 +1818,121 @@ class TestPlotSamples(unittest.TestCase):
                 g.plot_samples(key, "A", 10)
 
     def test_P16_full_block_row_plus_right_edge(self):
-        # 1500 samples @1s: the 'h' window is 1800 samples - the single
-        # bucket is [-300,1500): straddling the buffer start, full block
-        # row 0 [0,1024) + right edge [1024,1500) - the aligned-start
-        # boundary (no left edge). A divides by the full width 1800, so
-        # the 300 implicit zeros dilute it (624.58, not 749.5)
+        # 1500 samples @1s: the 'h' lattice has W = 1800 anchored at
+        # sample 0 - the single shown bin is j = 0: [0,1800) clamped to
+        # [0,1500), full block row 0 [0,1024) + right edge [1024,1500)
+        # - the aligned-start boundary (no left edge). A divides by the
+        # full width 1800, so the 300 implicit zeros dilute it
+        # (624.58, not 749.5)
         g = self._graph([float(i) for i in range(1500)], interval=1.0)
         self.assertEqual(g.plot_samples("h", "A", 1),
                          [sum(range(1500)) / 1800])
         self.assertEqual(g.plot_samples("h", "M", 1), [1499.0])
     def test_P17_full_block_row_plus_left_edge(self):
-        # 2048 samples @1s: the 'h' tail [248,2048) is full block row 1
-        # [1024,2048) + left edge [248,1024) - the aligned-end boundary
-        # (a1 == block boundary: no right edge)
+        # 2048 samples @1s: the 'h' lattice (W = 1800, anchored at 0)
+        # shows bin j = 1: [1800,3600) clamped to [1800,2048) - 248
+        # samples inside one block row [1024,2048): raw scan (no fully
+        # covered row), right edge on the block boundary (a1 == 2048:
+        # no partial right edge)
         g = self._graph([float(i) for i in range(2048)], interval=1.0)
         self.assertEqual(g.plot_samples("h", "A", 1),
-                         [sum(range(248, 2048)) / 1800])  # 1147.5
+                         [sum(range(1800, 2048)) / 1800])  # 265.02
         self.assertEqual(g.plot_samples("h", "M", 1), [2047.0])
 
     def test_P18_full_block_row_plus_both_edges(self):
-        # 4200 samples @1s: the 'h' tail [2400,4200) is full block row 3
-        # [3072,4096) + both partial edges - the fully table-driven path
-        g = self._graph([float(i) for i in range(4200)], interval=1.0)
+        # 5400 samples @1s: the 'h' lattice (W = 1800) shows bin
+        # j = 2: [3600,5400) exactly - left edge [3600,4096) and right
+        # edge [5120,5400) both partial, full block row [4096,5120)
+        # inside - the fully table-driven path with two raw edges
+        g = self._graph([float(i) for i in range(5400)], interval=1.0)
         self.assertEqual(g.plot_samples("h", "A", 1),
-                         [sum(range(2400, 4200)) / 1800])  # 3299.5
-        self.assertEqual(g.plot_samples("h", "M", 1), [4199.0])
+                         [sum(range(3600, 5400)) / 1800])  # 4499.5
+        self.assertEqual(g.plot_samples("h", "M", 1), [5399.0])
 
     def test_P19_bucket_straddling_two_partial_blocks_raw_scans(self):
-        # 3048 samples @1s, slots=2: bucket 0 [1248,2148) covers partial
-        # block 1 + partial block 2 - no fully covered row, so it raw
-        # scans even though it spans more than one block (the documented
-        # rare two-partial case); bucket 1 [2148,3048) is one partial
+        # 3048 samples @1s, slots=2: W = 900, anchored at 0 - bin
+        # j = 2 [1800,2700) covers partial block 1 + partial block 2
+        # (no fully covered row) and raw-scans even though it spans
+        # more than one block (the documented rare two-partial case);
+        # the newest bin j = 3 [2700,3600) clamps to [2700,3048) -
+        # one partial block
         g = self._graph([float(i) for i in range(3048)], interval=1.0)
         self.assertEqual(g.plot_samples("h", "A", 2),
-                         [sum(range(1248, 2148)) / 900,
-                          sum(range(2148, 3048)) / 900])   # 1697.5/2597.5
-        self.assertEqual(g.plot_samples("h", "M", 2), [2147.0, 3047.0])
+                         [sum(range(1800, 2700)) / 900,
+                          sum(range(2700, 3048)) / 900])   # 2249.5/1111.09
+        self.assertEqual(g.plot_samples("h", "M", 2), [2699.0, 3047.0])
 
     def test_P20_unaligned_trim_keeps_partial_head_row_out_of_the_tables(self):
         # 5032 samples @150s: the one-week cap (4032) trims mid-block,
         # keeping the stale partial head row 0 in the tables. Block 0
         # holds 1e7 poison values that left the buffer: any read of row 0
         # (a r0 below the trim) would inflate A ~1000x and set M to 1e7.
+        # The 'w' lattice (W = 4032, anchored at 0) shows bin j = 1:
+        # [4032,8064) clamped to [4032,5032) - 1000 samples raw-scanned
+        # (no fully covered block row), far from the poison.
         vals = [1e7] * 1000 + [float(i) for i in range(1000, 5032)]
         g = self._graph(vals, interval=150.0)
         self.assertEqual(g.seq, 5032)
         self.assertEqual(len(g.samples), 4032)   # trimmed to the week cap
         self.assertEqual(g.blk_first, 0)         # unaligned trim keeps row 0
         self.assertEqual(g.plot_samples("w", "A", 1),
-                         [sum(range(1000, 5032)) / 4032])  # 3015.5
+                         [sum(range(4032, 5032)) / 4032])  # 1123.88
         self.assertEqual(g.plot_samples("w", "M", 1), [5031.0])
 
     def test_P21_aligned_trim_drops_the_head_row(self):
         # 5056 samples @150s: the trim lands exactly on a block boundary,
-        # deleting row 0 from the tables (blk_first advances) - the bucket
-        # then starts its full rows right at the trim
+        # deleting row 0 from the tables (blk_first advances). The 'w'
+        # lattice bin j = 1: [4032,8064) clamps to [4032,5056) - 1024
+        # samples raw-scanned (the one fully covered row [4096,5120) is
+        # NOT contained: a1 = 5056 < 5120), still far from the poison.
         vals = [1e7] * 1024 + [float(i) for i in range(1024, 5056)]
         g = self._graph(vals, interval=150.0)
         self.assertEqual(len(g.samples), 4032)
         self.assertEqual(g.blk_first, 1)         # aligned trim dropped row 0
         self.assertEqual(g.plot_samples("w", "A", 1),
-                         [sum(range(1024, 5056)) / 4032])  # 3039.5
+                         [sum(range(4032, 5056)) / 4032])  # 1153.90
         self.assertEqual(g.plot_samples("w", "M", 1), [5055.0])
 
     def test_P22_young_buffer_draws_a_single_newest_bucket(self):
-        # one minute of data (120 samples @0.5s) against the 'd' axis
-        # (172800 samples): divmod(172800, 228) = (757, 204) - the
-        # 228-bucket view holds 204 buckets of width 758 + 24 of width
-        # 757. Only the newest bucket straddles the buffer start, so
-        # exactly one bar is nonzero - a young buffer no longer draws a
-        # stretched full-width plot
+        # one minute of data (120 samples @0.5s) against the 'd' lattice
+        # (172800 samples): W = 172800 // 228 = 757, anchored at sample
+        # 0 - only bin j = 0 [0,757) holds samples, clamped to
+        # [0,120). Exactly one bar is nonzero: a young buffer draws a
+        # single partial bin, not a stretched full-width plot
         g = self._graph([1500.0] * 100 + [3000.0] * 20, width=120)
         self.assertEqual(g.plot_samples("d", "M", 228),
                          [0.0] * 227 + [3000.0])
-        # the straddling bucket's A divides by its FULL width 758:
-        # (100x1500 + 20x3000) / 758
+        # the bin's A divides by its FULL width 757 (637 implicit
+        # zeros): (100x1500 + 20x3000) / 757
         self.assertEqual(g.plot_samples("d", "A", 228),
-                         [0.0] * 227 + [210000.0 / 758])
+                         [0.0] * 227 + [210000.0 / 757])
 
     def test_P23_straddling_bucket_A_dilutes_M_does_not(self):
-        # 250 samples of 10.0 against the 600-sample 'm' axis, 2 buckets
-        # of width 300: the newest bucket is [-50,250) - A divides 2500
-        # by 300 (50 implicit zeros), M takes the max of the 250
-        # existing samples
+        # 250 samples of 10.0 against the 'm' lattice (W = 300,
+        # anchored at 0), 2 bins: j = -1 is before the run (0.0), the
+        # newest bin j = 0 is [0,300) clamped to [0,250) - A divides
+        # 2500 by the full width 300 (50 implicit zeros), M takes the
+        # max of the 250 existing samples
         g = self._graph([10.0] * 250)
         self.assertEqual(g.plot_samples("m", "M", 2), [0.0, 10.0])
         self.assertEqual(g.plot_samples("m", "A", 2),
                          [0.0, 2500.0 / 300])
 
     def test_P24_bucket_widths_are_buffer_length_independent(self):
-        # the same (period, interval, slots) gives the same bucket width
+        # the same (period, interval, slots) gives the same bin width
         # whatever the buffer length: 100 vs 3000 samples of 5.0 @0.5s,
-        # 'd' axis (172800), 100 buckets of width 1728. The long buffer
-        # fills the newest bucket [1272,3000) completely; its bucket 98
-        # straddles with 1272 of its 1728 width, the short buffer's
-        # newest bucket straddles with 100
+        # 'd' lattice W = 172800 // 100 = 1728. The long buffer: bin
+        # j = 1 [1728,3456) clamps to [1728,3000) - 1272 of its 1728
+        # width, diluted in A while M stays full; bin j = 0 [0,1728)
+        # is completely full. The short buffer's only bin j = 0
+        # [0,1728) is diluted over 100 of its width
         gs = self._graph([5.0] * 100)
         gl = self._graph([5.0] * 3000)
         self.assertEqual(gl.plot_samples("d", "A", 100),
-                         [0.0] * 98 + [5.0 * 1272 / 1728, 5.0])
+                         [0.0] * 98 + [5.0, 5.0 * 1272 / 1728])
         self.assertEqual(gs.plot_samples("d", "A", 100),
                          [0.0] * 99 + [5.0 * 100 / 1728])
-        # same 1728 width: the long buffer's newest bucket is full (5.0)
-        # while the short buffer's newest bucket is diluted over it
+        # same 1728 width: M ignores the implicit zeros everywhere
         self.assertEqual(gl.plot_samples("d", "M", 100),
                          [0.0] * 98 + [5.0, 5.0])
         self.assertEqual(gs.plot_samples("d", "M", 100),
@@ -1926,8 +1961,9 @@ class TestPlotSamples(unittest.TestCase):
         empty = bg.Graph(10)
         self.assertEqual(empty.plot_peak("n"), 0.0)
         self.assertEqual(empty.plot_peak("w"), 0.0)  # empty buffer
-        # 'h' window [2400,4200): the 9999 spike in the oldest 100
-        # samples is outside the window
+        # 'h' view: slots = the graph's bar width (40) -> W = 45, the
+        # shown bins span [2430,4200): the 9999 spike in the oldest 100
+        # samples is outside
         g = self._graph([9999.0] * 100 + [float(i) for i in range(100, 4200)],
                         interval=1.0)
         self.assertEqual(g.plot_peak("h"), 4199.0)
@@ -1969,9 +2005,11 @@ class TestPlotSamples(unittest.TestCase):
         # 3 hours of 1s samples (values constant per hour, one poison
         # spike per hour) against a 1000-sample ring: rows 0 and 1 are
         # closed, the head partial [7200, 9800) and the buffer
-        # [9800, 10800) hold hour 2. slots = 3: divmod(10800, 3) cuts
-        # exactly along the hour boundaries, so the assembly is
-        # bit-exact against the reference over ALL samples ever added.
+        # [9800, 10800) hold hour 2. The 'l' lattice: W =
+        # max(1, ceil(10800/3)) = 3600 = exactly one lifetime hour,
+        # anchored at 0, so the bins cut exactly along the hour
+        # boundaries and the assembly is bit-exact against the
+        # reference over ALL samples ever added.
         g = bg.Graph(16, interval=1.0, hist_cap=1000)
         H = 3600
         n = 3 * H
@@ -1983,7 +2021,7 @@ class TestPlotSamples(unittest.TestCase):
                  else float(i // H + 1) * 10)
             g.add(v)
             all_v.append(v)
-        self.assertEqual(divmod(n, 3), (H, 0))
+        self.assertEqual(-(-n // 3), H)  # lattice width == one hour
         out_a = g.plot_samples("l", "A", 3)
         out_m = g.plot_samples("l", "M", 3)
         # reference: sum/max over every sample of each hour
@@ -2041,30 +2079,35 @@ class TestPlotSamples(unittest.TestCase):
         self.assertEqual(g.plot_samples("l", "M", 50),
                          g.plot_samples("l", "M", 50))
 
-    def test_P31_l_equals_w_style_whole_run_without_trims(self):
-        # no trims: the table is empty and 'l' is the w-style
-        # aggregation of the raw buffer over the WHOLE RUN
-        # (divmod(seq, slots) - the w window would stretch to a week)
+    def test_P31_l_lattice_over_the_whole_run_without_trims(self):
+        # no trims: the hour table is empty and 'l' aggregates the raw
+        # buffer over its own lattice: W = max(1, ceil(seq/slots)),
+        # anchored at sample 0 (the 'w' window would stretch to a week
+        # instead)
         g = self._graph([float(i % 13) for i in range(2000)], interval=1.0)
         n = g.seq
         for slots in (7, 24):
-            per, rem = divmod(n, slots)
-            sizes = [per] * slots
-            for b in range(slots - rem, slots):
-                sizes[b] = per + 1
+            W = max(1, -(-n // slots))
+            j_hi = (n - 1) // W
             seg = list(g.samples)  # == every sample ever added (no trims)
-            ref_a, ref_m = [], []
-            off = 0
-            for b in range(slots - 1, -1, -1):
-                a1 = n - off
-                off += sizes[b]
-                a0 = a1 - sizes[b]
-                ref_a.insert(0, sum(seg[a0:a1]) / sizes[b])
-                ref_m.insert(0, max(seg[a0:a1]))
+            ref_a, ref_m = [0.0] * slots, [0.0] * slots
+            for k in range(slots):
+                j = j_hi - k
+                if j < 0:
+                    continue
+                a0 = j * W
+                a1 = min(a0 + W, n)
+                ref_a[slots - 1 - k] = sum(seg[a0:a1]) / W
+                ref_m[slots - 1 - k] = max(seg[a0:a1])
             self.assertEqual(g.plot_samples("l", "A", slots), ref_a)
             self.assertEqual(g.plot_samples("l", "M", slots), ref_m)
+        # pinned for slots = 24: W = 84, the run fills 23 full bins and
+        # bin 23 = [1932,2000) is 68 of its 84 samples wide (diluted)
+        a24 = g.plot_samples("l", "A", 24)
+        self.assertEqual(a24[-1], sum(float(i % 13) for i in range(1932, 2000)) / 84)
+        self.assertNotEqual(a24[-1], a24[-2])  # full vs diluted
         # a trimmed graph must NOT equal 'w': the older-than-buffer
-        # buckets become non-zero via the hour table
+        # bins become non-zero via the hour table
         g = bg.Graph(16, interval=1.0, hist_cap=1000)
         for i in range(10800):
             g.add(float(i % 7) + 1.0)
@@ -2103,6 +2146,45 @@ class TestPlotSamples(unittest.TestCase):
         self.assertEqual(out_a, [0.0] * 4 + [450 / 810, 1.0, 1.0, 1.0,
                                              900 / 810, 2.0])
         self.assertEqual(out_m, [0.0] * 4 + [1.0, 1.0, 1.0, 1.0, 2.0, 2.0])
+
+    def test_P33_closed_bins_are_frozen_across_adds(self):
+        # lattice freeze-then-jump: closed bins NEVER change as samples
+        # are added - only the newest bin accumulates, and the whole
+        # view steps right exactly one column when seq crosses a bin
+        # edge. 'm' @0.5s slots = 10: W = 60; at seq = 540 the shown
+        # bins are j = -1..8 (j = 0..8 closed, j = 8 = [480,540) the
+        # full newest bin); after 60 more adds j_hi steps 8 -> 9 and
+        # bins j = 0..7 must be byte-identical for both aggs.
+        g = self._graph([float(i % 13) + 1.0 for i in range(540)],
+                        interval=0.5)
+        before = [g.plot_samples("m", a, 10) for a in "AM"]
+        for i in range(540, 600):
+            g.add(float(i % 13) + 1.0)
+        after = [g.plot_samples("m", a, 10) for a in "AM"]
+        # closed bins j = 0..7: before-index 1+j, after-index j
+        for a in range(2):
+            self.assertEqual(before[a][1:9], after[a][0:8])
+        # the newest column moved: before's newest bin (j = 8, at
+        # index 9) was a full 60-sample bin; after's newest (j = 9,
+        # index 9) holds different samples
+        self.assertNotEqual(before[0][9], after[0][9])
+        # 'l' freezes between width changes too: W = max(1, ceil(seq/10))
+        # stays 11 while seq runs 101..110, so at seq = 101 the shown
+        # bins j = 0..9 (j_hi = 9) and, 9 adds later at seq = 110, the
+        # still-closed bins j = 0..8 are unchanged while the newest bin
+        # (j = 9: [99,101) -> [99,110)) keeps growing
+        g = self._graph([float(i % 17) + 1.0 for i in range(101)],
+                        interval=1.0)
+        la = [g.plot_samples("l", a, 10) for a in "AM"]
+        for i in range(101, 110):
+            g.add(float(i % 17) + 1.0)
+        lb = [g.plot_samples("l", a, 10) for a in "AM"]
+        # j_hi = 9 in both states: bin j sits at index j; bins j = 0..8
+        # (indices 0..8) are frozen, the newest bin j = 9 (index 9)
+        # grows [99,101) -> [99,110)
+        for a in range(2):
+            self.assertEqual(la[a][0:9], lb[a][0:9])
+            self.assertNotEqual(la[a][9], lb[a][9])
 
 
 if __name__ == "__main__":

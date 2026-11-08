@@ -245,78 +245,82 @@ class Graph:
         """The sample values a plot with `slots` sample positions (two
         per drawn character) draws. `period`: n = the live hist tail
         (blanks as 0.0 - today's draw; it may be shorter than slots, the
-        plot grows a partial period from the left). The compressed
-        periods use a FIXED TIME AXIS: the window is the last
-        total = int(period_secs/interval) samples, cut into exactly
-        `slots` buckets anchored to the absolute sample index (the
-        newest bucket ends at seq), sizes from divmod(total, slots) -
-        the newest `rem` buckets get one extra sample. A bucket width
-        depends only on (period, interval, slots), never on how much
-        data is buffered, so a young buffer draws a few newest buckets
-        plus empty older ones instead of a stretched full-width plot,
-        and switching periods rescales the axis visibly. `agg`: A =
-        average, M = max per bucket (ignored for n). Buckets entirely
-        older than the kept buffer are 0.0 (skipped without scanning); a
-        bucket straddling the buffer start aggregates only the
-        available samples, but A divides by the FULL bucket width -
-        unmonitored time counts as 0.0, exactly like stored blanks, so a
-        sparse window's Avg bar sits low while the same bucket's M bar
-        is tall; M ignores the implicit zeros (samples are >= 0).
-        Bucket interiors aggregate through the per-1024-sample block
-        tables (full rows plus at most two raw partial edges, the
-        period_stats pattern; the straddling bucket's left edge clamps
-        to the buffer start): the A average is a float64-approximate
-        function of the stored samples, M the exact float32 max. "l"
-        (life) is the WHOLE RUN - window [0, seq): its buckets aggregate
-        the lifetime hour rows (one per fully aged-out HOUR_SAMPLES
-        sample hour) plus the open head-hour accumulator plus the kept
-        buffer; a bucket edge cutting a lifetime hour takes
-        width x (row_sum / row_width) for A and the row max for M
-        (exact for values constant within the hour). The run's samples
-        are never implicit zeros - every pre-buffer sample was folded
-        into a row - so 'l' averages dilute only where the run itself
-        has gaps. Pure: it touches neither the hist, the block tables,
-        the lifetime table, nor the L aggregates, so the MhHDWL columns
-        are unaffected. The result feeds compute_dots/dots_to_chars
+        plot grows a partial period from the left). The compressed periods
+        use FIXED BINS LIFETIME-ANCHORED (amendment 5): the bin width is
+        W = max(1, total // slots) with total = int(period_secs/interval)
+        samples - a constant per (period, interval), no divmod
+        remainder, no re-anchoring at the newest sample - and the lattice
+        is anchored at the monitor's lifetime start (sample 0): bin j
+        covers absolute samples [j*W, (j+1)*W), forever. The view is the
+        newest `slots` bins (j_hi = (seq-1)//W, showing j_hi-slots+1..
+        j_hi); a young buffer draws a few newest bins plus empty older
+        ones instead of a stretched full-width plot. Closed bins NEVER
+        change - only the newest bin accumulates, and the whole graph
+        steps right exactly one column when seq crosses a bin edge (every
+        W polls): literal freeze-then-jump. `agg`: A = sum over the bin's
+        available samples divided by the FULL width W (bins older than the
+        kept buffer or the run start aggregate nothing, so A dilutes over
+        the full width - unmonitored time counts as 0.0, exactly like
+        stored blanks); M = the max over the available samples (implicit
+        zeros ignored; samples are >= 0). Bin interiors aggregate through
+        the per-1024-sample block tables (full rows plus at most two raw
+        partial edges, the period_stats pattern; a bin straddling the
+        buffer start clamps its left edge to the buffer): the A average is
+        a float64-approximate function of the stored samples, M the exact
+        float32 max. "l" (life) uses its own lattice: W =
+        max(1, ceil(seq/slots)) recomputed per draw, still anchored at 0;
+        bins are frozen between width changes, a width change is a full
+        lattice recut (the expected life-view compression jump). Its bins
+        aggregate the lifetime hour rows (one per fully aged-out
+        HOUR_SAMPLES sample hour), the open head-hour accumulator, and the
+        kept buffer; a bin edge cutting a lifetime hour takes width x
+        (row_sum / row_width) for A and the row max for M (exact for
+        values constant within the hour) - every pre-buffer sample was
+        folded into a row, so 'l' averages dilute only where the run
+        itself has gaps. Pure: it touches neither the hist, the block
+        tables, the lifetime table, nor the L aggregates, so the MhHDWL
+        columns are unaffected. The result feeds compute_dots/dots_to_chars
         unchanged."""
         if period == "n":
             return [0.0 if v is None else float(v) for v in self.hist]
         if slots <= 0:
             return []
         base = self.seq - len(self.samples)  # absolute of samples[0]
-        out = [0.0] * slots
-        total = (self.seq if period == "l"  # the whole run, phase 4
-                 else int(self._PLOT_PERIOD_SECS[period] / self.interval))
-        per, rem = divmod(total, slots)
-        sizes = [per] * slots
-        for b in range(slots - rem, slots):  # the newest `rem` buckets
-            sizes[b] = per + 1
-        first = self.blk_first  # rows below it no longer mirror the buffer
         is_a = agg == "A"
-        is_l = period == "l"
-        off = 0  # samples newer than the current bucket's end
-        for b in range(slots - 1, -1, -1):  # newest bucket ends at seq
-            a1 = self.seq - off
-            off += sizes[b]
-            size = sizes[b]
-            if is_l:
-                # window [0, seq): nothing is implicit zero; only empty
-                # buckets (seq shorter than the axis) stay 0.0
-                if size == 0 or a1 <= 0:
-                    continue
-                out[b] = self._l_bucket(a1 - size, a1, size, is_a, base)
-                continue
-            if size == 0 or a1 <= base:
-                continue  # zero pad, or entirely older than the kept buffer
-            a0 = a1 - size
+        if period == "l":
+            # own lattice: W = max(1, ceil(seq/slots)), anchored at 0
+            W = max(1, -(-self.seq // slots))
+            j_hi = (self.seq - 1) // W
+            out = [0.0] * slots
+            for k in range(slots):
+                j = j_hi - k
+                if j < 0:
+                    break  # older bins are before the run: all zero
+                a0 = j * W
+                a1 = min(a0 + W, self.seq)
+                if a1 > 0:
+                    out[slots - 1 - k] = self._l_bucket(a0, a1, W, is_a, base)
+            return out
+        W = max(1, int(self._PLOT_PERIOD_SECS[period] / self.interval) // slots)
+        j_hi = (self.seq - 1) // W
+        first = self.blk_first  # rows below it no longer mirror the buffer
+        out = [0.0] * slots
+        for k in range(slots):  # newest bin first: j = j_hi - k
+            j = j_hi - k
+            if j < 0:
+                break  # bins before the run start are 0.0
+            a0 = j * W
+            a1 = min(a0 + W, self.seq)
+            if a1 <= base:
+                continue  # entirely older than the kept buffer
             if a0 < base:
-                a0 = base  # straddling bucket: left edge clamps to the buffer
+                a0 = base  # straddling bin: left edge clamps to the buffer
             r0 = (a0 + BLK_SAMPLES - 1) // BLK_SAMPLES  # first full row
             r1 = a1 // BLK_SAMPLES - 1  # last full row
             if r1 < r0:
-                # the bucket lies inside at most one block row: raw scan
+                # the bin lies inside at most one block row: raw scan
                 seg = self.samples[a0 - base:a1 - base]
-                out[b] = sum(seg) / size if is_a else max(seg)
+                out[slots - 1 - k] = sum(seg) / W if is_a else max(seg)
                 continue
             if is_a:
                 v = sum(self.blk_s[r0 - first:r1 - first + 1])
@@ -326,7 +330,7 @@ class Graph:
                 e = (r1 + 1) * BLK_SAMPLES - base  # right partial edge
                 if e < a1 - base:
                     v += sum(self.samples[e:a1 - base])
-                out[b] = v / size
+                out[slots - 1 - k] = v / W
             else:
                 v = max(self.blk_m[r0 - first:r1 - first + 1])
                 e = r0 * BLK_SAMPLES - base
@@ -335,7 +339,7 @@ class Graph:
                 e = (r1 + 1) * BLK_SAMPLES - base
                 if e < a1 - base:
                     v = max(v, max(self.samples[e:a1 - base]))
-                out[b] = v
+                out[slots - 1 - k] = v
         return out
 
     def _l_bucket(self, a0, a1, size, is_a, base):
@@ -422,19 +426,20 @@ class Graph:
         return s / size if is_a else mx
 
     def plot_peak(self, period: str) -> float:
-        """The max of the raw samples inside the period window - the
-        scale reference for the compressed views (shared by both aggs,
-        so the aggregated function is visible on the plot instead of
-        freezing against the lifetime peak or hiding behind the
-        aggregated max). n = the max over the live hist tail (blanks as
-        0.0); m..w = the last int(period_secs/interval) samples of the
-        kept buffer (the whole buffer when it is shorter); l = the WHOLE
-        RUN (phase 4): the max of the closed lifetime hour rows, the
-        open head-hour accumulator, and the kept buffer. The max flows
-        through the block tables' exact float32 maxima (full rows plus
-        at most two raw partial edges, the period_stats pattern).
-        Pure: reads only the hist, the buffer/tables, and the lifetime
-        table."""
+        """The max of the raw samples inside the view's bin ranges - the
+           scale reference for the compressed views (shared by both aggs, so
+           the aggregated function is visible on the plot instead of freezing
+           against the lifetime peak or hiding behind the aggregated max).
+           n = the max over the live hist tail (blanks as 0.0); m..w = the max
+           over the same lifetime-anchored bin lattice plot_samples shows: the
+           newest `slots` lattice bins (W = max(1, total // slots), bin j =
+           [j*W, (j+1)*W), anchored at sample 0), i.e. [j_lo*W, seq) with
+           j_lo = max(0, (seq-1)//W - slots + 1), clamped to the kept buffer;
+           l = the WHOLE RUN: the max of the closed lifetime hour rows, the
+           open head-hour accumulator, and the kept buffer. The max flows
+           through the block tables' exact float32 maxima (full rows plus at
+           most two raw partial edges, the period_stats pattern). Pure: reads
+           only the hist, the buffer/tables, and the lifetime table."""
         if period == "n":
             return builtins.max((v for v in self.hist if v is not None),
                                 default=0.0)
@@ -464,8 +469,9 @@ class Graph:
         if not L:
             return 0.0
         base = self.seq - L
-        g0 = max(self.seq - int(self._PLOT_PERIOD_SECS[period] / self.interval),
-                 base)  # absolute of the window head, clamped to the buffer
+        slots = self.hist.maxlen  # == the compressed view's bin count
+        W = max(1, int(self._PLOT_PERIOD_SECS[period] / self.interval) // slots)
+        g0 = max(max(0, (self.seq - 1) // W - slots + 1) * W, base)  # head of the first shown bin, clamped to the buffer
         g1 = self.seq
         first = self.blk_first
         r0 = (g0 + BLK_SAMPLES - 1) // BLK_SAMPLES
