@@ -95,6 +95,49 @@ would run (the dashes fill the scrolling area only):
   (dark green / dark yellow), an `A_DIM` attribute on terminals without
   those pairs.
 
+## Period/agg selector (compressed views)
+
+The footer carries one global selector for the three main graphs (batch,
+prefill, decode): `period=now 5m 30m 1h 1d 1w life  agg fn=Avg Max`.
+Keys: `n m h H d w l` set the period (default `n`, the live scrolling view
+of the previous section); `A`/`M` set the aggregation function (default
+`M`). The two spill/recall transfer rows keep their fixed ~13 s live view
+regardless of the selection.
+
+The compressed periods (everything except `now`) are **fixed bins,
+anchored at the monitor's lifetime start** — deliberately not a sliding
+window:
+
+- The bin width is `W = max(1, period_samples // slots)`, a constant per
+  (period, poll interval): `period_samples` is the period in poll
+  intervals, `slots` the number of sample positions the plot draws (two
+  per character). Bin `j` covers absolute samples `[j*W, (j+1)*W)` and
+  keeps doing so forever — **a closed bin never changes**.
+- The view is the newest `slots` bins. Only the newest, still-filling bin
+  moves, so the graph **freezes while that bin fills, then steps right
+  exactly one column when the sample counter crosses a bin edge** (every
+  `W` polls) — literal freeze-then-jump. A young buffer draws the few
+  newest bins it has plus empty older ones, not a stretched full-width
+  plot.
+- `Avg` = the bin's sum over its *available* samples divided by the full
+  width `W` — samples older than the kept buffer (or before the run
+  started) aggregate nothing, so unmonitored time dilutes the average
+  exactly like stored blanks. `Max` = the max over the available samples.
+- The compressed views scale to **the max of the raw samples inside the
+  shown bins**, shared by both aggregation functions: the `Avg` view's
+  diluted averages sit visibly below that scale, so switching the
+  aggregation changes the bar heights instead of hiding behind a rescale
+  (a lifetime-peak scale would instead freeze ordinary traffic at the
+  1-dot floor after a single old burst). The live `now` view and the
+  pinned batch graph keep their usual scales (lifetime peak / dot count).
+- **life** plots the whole monitor run on its own lattice: `W =
+  ceil(seq/slots)` recomputed per draw, still anchored at sample 0. Bins
+  freeze between width changes; a width change re-cuts the whole lattice
+  (the one expected compression jump). Raw samples cover the last week;
+  everything older was folded into coarse per-hour rows (count / sum /
+  max) as it aged out of the buffer, so `life` stays exact and cheap for
+  runs of any length.
+
 ## Best practices (for agent readers)
 
 Reusable rules distilled from this implementation:
@@ -123,6 +166,11 @@ Reusable rules distilled from this implementation:
   baseline row, dimmed so they read as context rather than live data),
   fed by a small raw-sample buffer alongside the sliding-window
   history.
+- For compressed long-period views, use fixed bins anchored at the run
+  start, not a sliding window: a window re-anchored at the newest sample
+  moves every bucket's span by one sample on every poll, so all bars
+  morph in place; a lifetime-anchored lattice keeps closed bins
+  immutable and the view only moves when a bin closes (freeze-then-jump).
 - Recompute period summaries (avg + max) from a time-capped raw-sample
   buffer on every poll instead of maintaining running aggregates
   incrementally: repeated add/subtract on floats leaves residue

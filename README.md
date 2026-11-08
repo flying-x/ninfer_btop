@@ -35,6 +35,22 @@ Polls the engine's Prometheus `/metrics` endpoint and renders:
   dashes, and drawn dimmed (grayed out against the moving bars). Each column's left dot
   line is the window average, its right dot line the window max, in the graph's
   own dot scale; `L` covers this process's life, not the engine's.
+- **period/agg selector (footer)** — one global view selector for the three
+  main graphs (batch, prefill, decode): `period=now 5m 30m 1h 1d 1w life
+  agg fn=Avg Max`, keys `n m h H d w l` set the period (default `now`) and
+  `A`/`M` the aggregation (default `Max`). `now` is the live scrolling view
+  above; the other periods re-plot the same history as **fixed bins anchored
+  at the monitor's start**: each dot column is one bin covering a constant
+  span of samples that never changes once closed, so the graph freezes while
+  the newest bin fills, then steps right exactly one column when it closes.
+  `Avg` divides a bin's sum by the bin's full width (unmonitored time
+  counts as 0, like stored blanks); `Max` takes the bin's max. The
+  compressed views scale to the max over the samples they show (shared by
+  both aggs), so the aggregation function stays visible on the plot.
+  `life` plots the whole monitor run: raw samples cover one week and
+  everything older is kept as a coarse per-hour table, so runs of any
+  length plot exactly and cheaply. The spill/recall rows keep their fixed
+  ~13 s live view. Details: [docs/graph_rendering.md](docs/graph_rendering.md)
 - token totals: input (prompt) / output (generation)
 - Device KV ∥ Host KV ∥ Cache (checkpoint reuse) — three panels side by side
   on one shared title row plus 4 content rows (btop-style). The two KV
@@ -99,7 +115,10 @@ python3 ninfer_btop.py --url URL [-i INTERVAL_MS] [--text] [--re-calib]
 - `--pricing-model KEY`  cloud-API pricing row to use — a model key from `pricing.yaml` (default `qwen3.8-27b`)
 - `--pricing-file PATH`  use a different pricing YAML file (default: `pricing.yaml` next to the script)
 
-Keys in TUI mode: `q`/Esc quit.
+Keys in TUI mode: `q`/Esc quit; `n m h H d w l` set the main graphs' period
+selector (`now`/`5m`/`30m`/`1h`/`1d`/`1w`/`life`, default `now`) and `A`/`M`
+the aggregation function (`Avg`/`Max`, default `Max`) — see the
+[period/agg selector](docs/graph_rendering.md) notes.
 The app ignores SIGTTOU, so it also works as a background job.
 
 ## Startup calibration & utilization
