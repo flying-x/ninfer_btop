@@ -21,8 +21,8 @@ Invariants:
     trailing zero), so each poll shifts the graph exactly half a
     character
   - the M/h/H/D/W summaries are exact functions of the one-week block-
-    partitioned history, while L is coarse grain hourly stats that
-    grow unbound but stays small in any reasonable life time length.
+    partitioned history, while L is coarse-grained hourly stats that
+    grow unbounded but stay small over any reasonable lifetime.
 """
 import array
 import builtins
